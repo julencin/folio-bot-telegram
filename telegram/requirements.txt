@@ -1,3 +1,0 @@
-# Solo para la Raspberry (el bot). Folio no necesita nada de esto.
-python-telegram-bot==21.6
-openai>=1.40
