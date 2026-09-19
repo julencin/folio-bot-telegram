@@ -10,6 +10,10 @@ El bot de Telegram de Folio: le cuentas lo que gastas y el apunte llega a Folio.
 Si cuentas varias cosas de una vez («las cuentas de la semana»), salen varios apuntes:
 el bot los enseña juntos y puedes mandarlos todos o revisarlos uno a uno.
 
+Lo mismo con la Cartera: «he metido 200 € en Bitcoin a 58.000» o la captura de una orden
+del bróker salen como operación de cartera (📈 compra, 📉 venta, 💶 dividendo…), y en
+Folio van a la Cartera en vez de al Historial.
+
 Solo contesta a los usuarios de FOLIO_USUARIOS (id de Telegram → perfil de Folio). A
 cualquier otro le dice su id y nada más, para que puedas añadirlo si es de casa.
 
@@ -77,7 +81,41 @@ def _cuando(fecha_iso: str, hoy: date) -> str:
     return fecha.strftime("%d/%m/%Y")
 
 
+ICONOS_CARTERA = {"compra": "📈", "venta": "📉", "dividendo": "💶", "interés": "💶", "comisión": "🧾",
+                  "traspaso": "🔁", "split": "✂️"}
+
+
+def _numero(valor: float, decimales: int = 8) -> str:
+    """3 → «3»; 0.00344828 → «0,00344828»; 58000 → «58.000»."""
+    texto = f"{valor:,.{decimales}f}".rstrip("0").rstrip(".")
+    return texto.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _dinero(valor: float, divisa: str = "EUR") -> str:
+    simbolo = {"EUR": "€", "USD": "$", "GBP": "£"}.get(divisa.upper(), divisa.upper())
+    entero, dec = f"{abs(valor):,.2f}".split(".")
+    return f"{entero.replace(',', '.')},{dec} {simbolo}"
+
+
+def resumen_cartera(op: dict[str, Any], hoy: date | None = None) -> str:
+    hoy = hoy or date.today()
+    signo = interprete.SIGNO_CARTERA.get(op["tipo"], 0)
+    cabeza = (f"{ICONOS_CARTERA.get(op['tipo'], '📈')} *{op['tipo'].capitalize()}* · {op['activo']}"
+              + (" _(nuevo)_" if op.get("nuevo") else ""))
+    partes = []
+    if op["importe"]:
+        partes.append(("−" if signo < 0 else "+" if signo > 0 else "") + _dinero(op["importe"], "EUR" if op["divisa"] == "EUR" else op["divisa"]))
+    if op["cantidad"]:
+        partes.append(f"{_numero(op['cantidad'])} u." + (f" a {_dinero(op['precio'], op['divisa'])}" if op["precio"] else ""))
+    if op["comision"]:
+        partes.append(f"comisión {_dinero(op['comision'], op['divisa'])}")
+    partes += [op["cuenta"] or "sin bróker", _cuando(op["fecha"], hoy)]
+    return f"{cabeza}\n" + " · ".join(partes) + "\n_A la Cartera_"
+
+
 def resumen(apunte: dict[str, Any], hoy: date | None = None) -> str:
+    if apunte.get("clase") == "cartera":
+        return resumen_cartera(apunte, hoy)
     hoy = hoy or date.today()
     ruta = " › ".join(x for x in (apunte["categoria"], apunte["categoria2"], apunte["categoria3"]) if x)
     partes = [ruta or "sin categoría", apunte["cuenta"] or "sin cuenta", _cuando(apunte["fecha"], hoy)]
@@ -90,10 +128,18 @@ def resumen_varios(apuntes: list[dict[str, Any]], hoy: date | None = None) -> st
     hoy = hoy or date.today()
     lineas = [f"*{len(apuntes)} apuntes:*"]
     for n, a in enumerate(apuntes, 1):
+        if a.get("clase") == "cartera":
+            signo = interprete.SIGNO_CARTERA.get(a["tipo"], 0)
+            dinero = (("−" if signo < 0 else "+" if signo > 0 else "") + _dinero(a["importe"], a["divisa"])) if a["importe"] else ""
+            lineas.append(f"{n}. {ICONOS_CARTERA.get(a['tipo'], '📈')} {a['tipo']} · {a['activo']}"
+                          + (f" · {dinero}" if dinero else "") + f" · {_cuando(a['fecha'], hoy)}")
+            continue
         ruta = " › ".join(x for x in (a["categoria"], a["categoria2"]) if x) or "sin categoría"
         lineas.append(f"{n}. {_euros(a['importe'])} · {a['concepto']} · {ruta} · {_cuando(a['fecha'], hoy)}"
                       + (" · a medias" if a.get("compartido") else ""))
-    lineas.append(f"\nEn total: *{_euros(sum(a['importe'] for a in apuntes))}*")
+    gastos = [a for a in apuntes if a.get("clase") != "cartera"]
+    if len(gastos) > 1:
+        lineas.append(f"\nGastos e ingresos: *{_euros(sum(a['importe'] for a in gastos))}*")
     return "\n".join(lineas)
 
 
@@ -133,6 +179,13 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
     grupos: dict[str, dict[str, Any]] = {}      # varios de un mismo mensaje
 
     def botones(ident: str) -> InlineKeyboardMarkup:
+        pendiente = esperando.get(ident) or {}
+        if (pendiente.get("apunte") or {}).get("clase") == "cartera":
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ A Folio", callback_data=f"ok:{ident}"),
+                 InlineKeyboardButton("🏷️ Tipo", callback_data=f"tipo:{ident}")],
+                [InlineKeyboardButton("✖ Descartar", callback_data=f"no:{ident}")],
+            ])
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ A Folio", callback_data=f"ok:{ident}"),
              InlineKeyboardButton("🏷️ Categoría", callback_data=f"cat:{ident}")],
@@ -163,7 +216,8 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             "¡Hola! Soy Foli 🟧. Cuéntame lo que gastas o lo que te entra, como te salga:\n"
             "· «15 € en un bar»\n· «ayer 37 de gasolina con la VISA»\n"
             "· las cuentas de la semana de una tirada: «el lunes 40 de gasolina, el martes 12 en el Mercadona…»\n"
-            "· una 🎙️ nota de voz\n· la 📷 foto del ticket\n\n"
+            "· una 🎙️ nota de voz\n· la 📷 foto del ticket\n"
+            "· tu cartera: «he metido 200 € en Bitcoin a 58.000», o la captura de la orden del bróker\n\n"
             "Te enseño cómo lo he entendido y, si le das a ✅, llega a la bandeja de Folio.\n\n"
             "/stats te dice cuánto llevo gastado en OpenAI."
         )
@@ -317,6 +371,17 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
         elif accion == "no":
             esperando.pop(ident, None)
             await consulta.edit_message_text("Descartado. No llega nada a Folio.")
+        elif accion == "tipo":
+            tipos = interprete.TIPOS_CARTERA
+            filas = [[InlineKeyboardButton(f"{ICONOS_CARTERA[t]} {t}", callback_data=f"t1:{ident}:{i}")
+                      for i, t in list(enumerate(tipos))[j:j + 2]] for j in range(0, len(tipos), 2)]
+            filas.append([InlineKeyboardButton("← Volver", callback_data=f"ver:{ident}")])
+            await consulta.edit_message_text("¿Qué ha sido?", reply_markup=InlineKeyboardMarkup(filas))
+        elif accion == "t1":
+            tipos = interprete.TIPOS_CARTERA
+            if extra.isdigit() and int(extra) < len(tipos):
+                apunte["tipo"] = tipos[int(extra)]
+            await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.MARKDOWN, reply_markup=botones(ident))
         elif accion == "signo":
             apunte["importe"] = -apunte["importe"]
             await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.MARKDOWN, reply_markup=botones(ident))

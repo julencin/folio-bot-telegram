@@ -10,6 +10,12 @@ De lo que mandas al bot a apuntes de Folio. Todo pasa por OpenAI y nada más:
 De un mismo mensaje pueden salir **varios apuntes**: cada gasto o ingreso distinto que
 cuentes es uno. Un ticket, en cambio, es uno solo (su total), aunque tenga muchas líneas.
 
+Y hay dos clases de apunte: los **gastos** (van al Historial) y las **operaciones de
+cartera** (compras, ventas, dividendos… de la Cartera). «He metido 200 € en Bitcoin a
+58.000» o la captura de una orden del bróker son de cartera; GPT decide cuál es cuál y un
+mismo mensaje puede traer de las dos. Si le das el importe y el precio, la cantidad se
+calcula aquí (no se le pide a GPT que divida).
+
 Se pide a GPT una respuesta con **salida estructurada**: un JSON que tiene que cumplir un
 esquema cerrado, en el que la categoría, la subcategoría y la cuenta solo pueden ser una
 de las tuyas (van como `enum`). Así no se puede inventar una categoría que Folio luego
@@ -47,8 +53,30 @@ Cuántos movimientos:
 - Una foto de un ticket es UN movimiento: el TOTAL pagado, con el nombre del comercio como
   concepto y la fecha del ticket. No separes las líneas del ticket. Si el texto que la acompaña
   dice otra cosa (otra categoría, «a medias»…), manda el texto.
-- Si no hay ningún gasto ni ingreso (un saludo, una pregunta, algo sin importe), lista vacía y
+- Si no hay ningún gasto ni ingreso (un saludo, una pregunta, algo sin importe), listas vacías y
   explica en «duda», en una frase amable y corta, qué necesitas.
+
+Inversiones: van en «operaciones», NUNCA en «apuntes».
+- Si compra, vende, cobra un dividendo o intereses, paga una comisión suelta, traspasa o hay un
+  split de un activo (acciones, ETF, fondos, criptomonedas…), es una operación de su Cartera,
+  no un gasto. Ejemplos: «he metido 200 € en Bitcoin», «compré 3 acciones de Apple a 180 $»,
+  «vendí el ETF», «me han pagado 12 € de dividendo de Coca-Cola», «el broker me cobró 2 € de custodia».
+- Una captura de pantalla de un bróker o de un exchange: lee la operación entera (tipo, activo,
+  cantidad, precio, comisión, total, divisa, fecha). Si la captura trae varias operaciones, una
+  por cada una.
+- tipo: compra, venta, dividendo, interés, comisión, traspaso o split.
+- activo: si es uno de su lista de activos, escríbelo EXACTAMENTE como aparece en ella (aunque lo
+  diga de otra forma: «BTC», «el bitcoin»). Si es nuevo, su nombre normal.
+- isin: el de la lista si es uno suyo, o el que se vea en la captura; si no, vacío.
+- importe: el dinero TOTAL que salió o entró de la cuenta; en una compra, con la comisión incluida.
+  0 si no se sabe.
+- cantidad: unidades o participaciones. 0 si no lo dice (se calcula con el importe y el precio).
+- precio: por unidad, en la divisa del activo. 0 si no lo dice.
+- comision: 0 si no hay o no lo dice.
+- divisa: la del activo (la de la lista si es uno suyo); EUR si no se sabe.
+- cuenta: el bróker o exchange; el de la lista si es uno de ellos; si no lo dice, el del activo
+  en su lista, o vacío.
+- fecha y confianza: como en los gastos.
 
 Cada movimiento:
 - importe: siempre positivo, en euros («15,50» → 15.5; «cinco euros» → 5).
@@ -94,6 +122,15 @@ def _subcategorias(arbol: dict[str, dict[str, list[str]]]) -> tuple[list[str], l
     return sorted(segundas), sorted(terceras)
 
 
+TIPOS_CARTERA = ["compra", "venta", "dividendo", "interés", "comisión", "traspaso", "split"]
+#  Cómo mueve el dinero cada tipo (el mismo criterio que Folio): −1 sale, +1 entra.
+SIGNO_CARTERA = {"compra": -1, "venta": 1, "dividendo": 1, "interés": 1, "comisión": -1, "traspaso": 0, "split": 0}
+
+
+def _cartera(contexto: dict[str, Any]) -> dict[str, Any]:
+    return contexto.get("cartera") or {"activos": [], "cuentas": [], "tipos": TIPOS_CARTERA}
+
+
 def esquema(contexto: dict[str, Any]) -> dict[str, Any]:
     arbol = contexto.get("categorias") or {}
     segundas, terceras = _subcategorias(arbol)
@@ -116,11 +153,35 @@ def esquema(contexto: dict[str, Any]) -> dict[str, Any]:
             "confianza": {"type": "string", "enum": ["alta", "media", "baja"]},
         },
     }
+    tipos = [t for t in _cartera(contexto).get("tipos") or TIPOS_CARTERA if t in SIGNO_CARTERA] or TIPOS_CARTERA
+    operacion = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["tipo", "activo", "isin", "cantidad", "precio", "comision", "importe", "divisa",
+                     "cuenta", "fecha", "confianza"],
+        "properties": {
+            "tipo": {"type": "string", "enum": tipos},
+            "activo": {"type": "string"},
+            "isin": {"type": "string"},
+            "cantidad": {"type": "number"},
+            "precio": {"type": "number"},
+            "comision": {"type": "number"},
+            "importe": {"type": "number"},
+            "divisa": {"type": "string"},
+            "cuenta": {"type": "string"},
+            "fecha": {"type": "string"},
+            "confianza": {"type": "string", "enum": ["alta", "media", "baja"]},
+        },
+    }
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["apuntes", "duda"],
-        "properties": {"apuntes": {"type": "array", "items": apunte}, "duda": {"type": "string"}},
+        "required": ["apuntes", "operaciones", "duda"],
+        "properties": {
+            "apuntes": {"type": "array", "items": apunte},
+            "operaciones": {"type": "array", "items": operacion},
+            "duda": {"type": "string"},
+        },
     }
 
 
@@ -143,6 +204,14 @@ def _memoria_en_texto(memoria: list[dict[str, Any]]) -> str:
     )
 
 
+def _activos_en_texto(cartera: dict[str, Any]) -> str:
+    filas = [
+        "- " + " · ".join(x for x in (a.get("activo"), a.get("isin"), a.get("divisa"), a.get("cuenta")) if x)
+        for a in cartera.get("activos") or []
+    ]
+    return "\n".join(filas) or "(todavía ninguno)"
+
+
 def calendario(hoy: date, dias: int = 10) -> str:
     """Los últimos días con su nombre: así «el martes» tiene una fecha sin cuentas raras."""
     return ", ".join(
@@ -157,7 +226,9 @@ def mensajes(contexto: dict[str, Any], frase: str, hoy: date, imagen: bytes | No
         f"Árbol de categorías (categoría: subcategorías (subcategorías 2)):\n{_arbol_en_texto(contexto.get('categorias') or {})}\n\n"
         f"Cuentas: {', '.join(contexto.get('cuentas') or []) or '(ninguna)'}\n"
         f"Cuenta habitual: {contexto.get('cuenta_habitual') or '(ninguna)'}\n\n"
-        f"Memoria (concepto → dónde suele ir):\n{_memoria_en_texto(contexto.get('memoria') or [])}\n"
+        f"Memoria (concepto → dónde suele ir):\n{_memoria_en_texto(contexto.get('memoria') or [])}\n\n"
+        f"Activos de su cartera (nombre · ISIN · divisa · bróker):\n{_activos_en_texto(_cartera(contexto))}\n"
+        f"Brókers: {', '.join(_cartera(contexto).get('cuentas') or []) or '(ninguno)'}\n"
     )
     variable = (
         f"Hoy es {DIAS[hoy.weekday()]} {hoy.isoformat()}.\n"
@@ -177,6 +248,81 @@ def mensajes(contexto: dict[str, Any], frase: str, hoy: date, imagen: bytes | No
 
 
 # ── Lo que vuelve ──────────────────────────────────────────────────────────
+
+
+def _fecha(bruto: dict[str, Any], hoy: date) -> str:
+    try:
+        fecha = date.fromisoformat(str(bruto.get("fecha") or ""))
+    except ValueError:
+        fecha = hoy
+    if fecha > hoy or fecha < hoy - timedelta(days=400):
+        fecha = hoy
+    return fecha.isoformat()
+
+
+def _num(valor: Any) -> float:
+    try:
+        return abs(float(valor or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _llano(texto: str) -> str:
+    import unicodedata
+
+    t = unicodedata.normalize("NFKD", str(texto or "").lower())
+    return " ".join("".join(c for c in t if not unicodedata.combining(c)).split())
+
+
+def _operacion(bruto: dict[str, Any], contexto: dict[str, Any], hoy: date, texto: str, origen: str) -> dict[str, Any] | None:
+    """Una operación de cartera, con lo que falte deducido de lo que sí hay."""
+    tipo = str(bruto.get("tipo") or "")
+    activo = str(bruto.get("activo") or "").strip()[:120]
+    if tipo not in SIGNO_CARTERA or not activo:
+        return None
+    cartera = _cartera(contexto)
+    conocido = next((a for a in cartera.get("activos") or []
+                     if _llano(a.get("activo", "")) == _llano(activo)
+                     or (bruto.get("isin") and _llano(a.get("isin", "")) == _llano(bruto["isin"]))), None)
+    if conocido:
+        activo = conocido["activo"]
+    cantidad, precio = _num(bruto.get("cantidad")), _num(bruto.get("precio"))
+    comision, importe = _num(bruto.get("comision")), _num(bruto.get("importe"))
+    # Lo que falta, de lo que hay: «200 € a 58.000» es una cantidad; «3 a 180» es un importe.
+    if not cantidad and importe and precio and tipo in ("compra", "venta"):
+        neto = importe - comision if tipo == "compra" else importe + comision
+        cantidad = max(0.0, neto) / precio
+    if not importe and cantidad and precio:
+        bruto_total = cantidad * precio
+        importe = bruto_total + comision if tipo == "compra" else max(0.0, bruto_total - comision) if tipo == "venta" else bruto_total
+    if not importe and not cantidad:
+        return None
+    confianza = str(bruto.get("confianza") or "media")
+    if not conocido and confianza == "alta":
+        confianza = "media"  # un activo nuevo: que lo mire
+    cuentas = cartera.get("cuentas") or []
+    cuenta = str(bruto.get("cuenta") or "").strip()
+    cuenta = next((c for c in cuentas if _llano(c) == _llano(cuenta)), cuenta) or (conocido or {}).get("cuenta", "")
+    return {
+        "clase": "cartera",
+        "id": uuid.uuid4().hex[:12],
+        "fecha": _fecha(bruto, hoy),
+        "tipo": tipo,
+        "activo": activo,
+        "isin": (str(bruto.get("isin") or "").strip() or (conocido or {}).get("isin", "")).upper()[:20],
+        "cantidad": round(cantidad, 8),
+        "precio": round(precio, 8),
+        "comision": round(comision, 2),
+        "importe": round(importe, 2),
+        "divisa": (str(bruto.get("divisa") or "").strip() or (conocido or {}).get("divisa") or "EUR").upper()[:5],
+        "cuenta": cuenta[:80],
+        "nota": "",
+        "texto": texto.strip()[:500],
+        "origen": origen,
+        "confianza": confianza,
+        "nuevo": conocido is None,
+        "creado": datetime.now().isoformat(timespec="seconds"),
+    }
 
 
 def _uno(bruto: dict[str, Any], contexto: dict[str, Any], hoy: date, texto: str, origen: str) -> dict[str, Any] | None:
@@ -214,6 +360,7 @@ def _uno(bruto: dict[str, Any], contexto: dict[str, Any], hoy: date, texto: str,
 
     signo = 1 if bruto.get("sentido") == "entra" else -1
     return {
+        "clase": "gasto",
         "id": uuid.uuid4().hex[:12],
         "fecha": fecha.isoformat(),
         "concepto": str(bruto.get("concepto") or "").strip()[:120] or (sub or cat or "Sin concepto"),
@@ -235,6 +382,7 @@ def validar(bruto: dict[str, Any], contexto: dict[str, Any], hoy: date, texto: s
             origen: str = "telegram") -> Resultado:
     """De la respuesta de GPT a apuntes que Folio va a aceptar. Corrige lo que no cuadra."""
     apuntes = [a for a in (_uno(b, contexto, hoy, texto, origen) for b in bruto.get("apuntes") or []) if a]
+    apuntes += [o for o in (_operacion(b, contexto, hoy, texto, origen) for b in bruto.get("operaciones") or []) if o]
     duda = str(bruto.get("duda") or "")
     if not apuntes and not duda:
         duda = "No veo ningún gasto ni ingreso ahí. ¿Cuánto ha sido y en qué?"

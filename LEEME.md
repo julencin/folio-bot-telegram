@@ -9,6 +9,36 @@ Le cuentas al bot lo que gastas, como te salga, y el apunte llega a Folio. Puede
   martes 12 en el Mercadona y ayer 60 de cena a medias». Salen **tres apuntes separados**, cada
   uno con su fecha. El bot los enseña juntos y puedes mandar los tres o revisarlos uno a uno.
 
+## La Cartera
+
+Lo mismo sirve para tus inversiones. El bot distingue solo si lo que le cuentas es un gasto o
+una operación de la Cartera: compra, venta, dividendo, interés, comisión, traspaso o split.
+
+| Cómo se lo dices | Qué saca |
+|---|---|
+| «He metido 200 € en Bitcoin a 58.000» | compra · Bitcoin · 200 € · cantidad = 200 / 58.000 |
+| «He metido 200 € en Bitcoin a 58.000, comisión 1,50» | igual, y la cantidad sale de 198,50 € |
+| «Compré 3 acciones de Apple a 180 dólares en Trade Republic» | compra · 3 × 180 $ · bróker Trade Republic |
+| «Me han pagado 12 € de dividendo de Coca-Cola» | dividendo · 12 € |
+| **Captura de la orden** (del bróker o del exchange) | lo lee todo: tipo, activo, cantidad, precio, comisión, total, fecha, divisa |
+| Nota de voz con cualquiera de las anteriores | igual que el texto |
+
+- **Lo más fiable es la captura** de la pantalla de «orden ejecutada»: trae todo y no hay que
+  acordarse de nada.
+- Por texto o por voz, **basta con el importe y el precio**. La cantidad la calcula el bot, no
+  GPT, para que no haya errores de cuentas. Si das la cantidad y el precio, calcula el importe.
+- **La comisión, si la dices.** Si no, cero.
+- **Reconoce tus activos.** Folio le pasa la lista de los que ya tienes: nombre, ISIN, divisa y
+  bróker, pero no cantidades ni importes. Así «BTC» o «el bitcoin» caen en tu activo «Bitcoin»,
+  con su bróker. Si es un activo que no tenías, lo marca como _(nuevo)_ para que lo mires.
+- En Telegram sale con su icono (📈 compra, 📉 venta, 💶 dividendo…) y un botón **🏷️ Tipo**
+  para cambiarlo si no ha acertado.
+- En Folio aparece en la misma bandeja del Historial, con «→ Cartera». Al aceptarlo va al libro
+  de la Cartera, y de ahí al Resumen como inversión, igual que si lo metieras a mano. «Revisar»
+  abre el formulario de la Cartera ya relleno.
+
+Un mismo mensaje puede traer de las dos cosas: «30 € de gasolina y he metido 100 € en el ETF».
+
 Todo pasa por OpenAI, con tu misma clave. El audio lo transcribe `gpt-4o-mini-transcribe` y la
 foto la lee directamente el modelo, que ve imágenes. No interviene nadie más.
 
@@ -78,8 +108,10 @@ Lo que cuesta de más:
 En resumen, **menos de 20 céntimos al mes** apuntando tres o cuatro cosas al día, aunque sean
 audios o tickets. Lo que no es un apunte («hola») cuesta lo mismo, porque también pasa por GPT.
 
-`/coste` te dice lo que llevas este mes. Con `FOLIO_MOSTRAR_COSTE=1`, cada respuesta dice lo que
-ha costado.
+`/stats` te dice lo que lleva gastado el bot, en euros: **hoy, este mes y desde siempre**, con
+cuántos mensajes ha recibido (textos, notas de voz y fotos), cuántos apuntes ha sacado y cuánto
+lleva cada uno de vosotros. Con `FOLIO_MOSTRAR_COSTE=1`, cada respuesta dice lo que ha costado
+(«Coste: 0,0017 €»: una fracción de céntimo).
 
 ## Instalación en la Raspberry
 
@@ -114,8 +146,9 @@ ha costado.
 
 | Fichero | Qué hace |
 |---|---|
-| `bot.py` | Telegram: texto, voz, fotos, botones, `/start`, `/coste` |
-| `interprete.py` | Lo que mandas → apuntes: el prompt, el esquema estricto, la validación y la transcripción |
+| `bot.py` | Telegram: texto, voz, fotos, botones, `/start`, `/stats` |
+| `estadisticas.py` | Lo gastado y recibido por día, mes, total y persona (`coste.json`) |
+| `interprete.py` | Lo que mandas → gastos y operaciones de cartera: el prompt, el esquema estricto, la validación y la transcripción |
 | `bandeja.py` | Leer `contexto.json` y dejar apuntes en Drive (carpeta o rclone) |
 | `precios.py` | Los precios oficiales y el cálculo del coste por mensaje |
 | `.env.ejemplo` | La configuración; el `.env` de verdad no se sube a git |
