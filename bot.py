@@ -23,6 +23,7 @@ Configuración: variables de entorno o un `.env` al lado de este fichero (ver .e
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import date, timedelta
@@ -30,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from .bandeja import Bandeja
+from .esperando import Esperando
 from . import estadisticas, interprete, precios
 
 AQUI = Path(__file__).resolve().parent
@@ -173,10 +175,14 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
     mostrar_coste = os.environ.get("FOLIO_MOSTRAR_COSTE", "0") == "1"
     bandeja = Bandeja(os.environ.get("FOLIO_BANDEJA"), os.environ.get("FOLIO_RCLONE"))
     cliente = OpenAI()
-    #  Lo que espera a que pulses un botón, en memoria. Si el bot se reinicia, el botón
-    #  dice que ha caducado y vuelves a mandarlo.
-    esperando: dict[str, dict[str, Any]] = {}   # un apunte suelto
-    grupos: dict[str, dict[str, Any]] = {}      # varios de un mismo mensaje
+    #  Lo que espera a que pulses un botón. En disco: sobrevive a los reinicios del bot y
+    #  dura 14 días (ver esperando.py).
+    esperando = Esperando(AQUI / "esperando.json")   # un apunte suelto
+    grupos = Esperando(AQUI / "grupos.json")         # varios de un mismo mensaje
+    #  Lo ya mandado a Folio: si vuelves a pulsar ✅, se contesta «ya está» y no se repite.
+    enviados = Esperando(AQUI / "enviados.json")
+    #  Lo que se está mandando ahora mismo: un segundo toque no lo manda dos veces.
+    en_curso: set[str] = set()
 
     def botones(ident: str) -> InlineKeyboardMarkup:
         pendiente = esperando.get(ident) or {}
@@ -237,12 +243,12 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             return
         await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         try:
-            contexto = bandeja.contexto(perfil)
+            contexto = await asyncio.to_thread(bandeja.contexto, perfil)
         except FileNotFoundError as exc:
             await update.message.reply_text(str(exc))
             return
         try:
-            resultado = interprete.interpretar(cliente, modelo, contexto, frase, imagen=imagen)
+            resultado = await asyncio.to_thread(interprete.interpretar, cliente, modelo, contexto, frase, None, imagen)
         except Exception:  # la red, la clave, el modelo…: se dice y ya
             log.exception("OpenAI ha fallado")
             await update.message.reply_text("No he podido entenderlo ahora mismo (OpenAI no responde). Prueba en un rato.")
@@ -287,7 +293,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
         fichero = await nota.get_file()
         audio = bytes(await fichero.download_as_bytearray())
         try:
-            frase = interprete.transcribir(cliente, audio, "nota.ogg")
+            frase = await asyncio.to_thread(interprete.transcribir, cliente, audio, "nota.ogg")
         except Exception:
             log.exception("La transcripción ha fallado")
             await update.message.reply_text("No he podido escuchar la nota ahora mismo. Prueba otra vez o escríbemelo.")
@@ -311,10 +317,41 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
         imagen = bytes(await fichero.download_as_bytearray())
         await entender(update, ctx, update.message.caption or "", imagen=imagen, tipo="foto")
 
+    async def mandar(consulta: Any, ident: str, perfil: str, apuntes: list[dict[str, Any]], texto: str,
+                     volver: InlineKeyboardMarkup) -> None:
+        """
+        Mandar a Folio, sin hacer esperar: se contesta al toque, se quitan los botones (no
+        se puede pulsar dos veces) y se sube a Drive aparte. Al acabar, el mensaje dice cómo ha ido.
+        """
+        if enviados.get(ident):
+            await consulta.answer("✅ Ya está en la bandeja de Folio.")
+            return
+        if ident in en_curso:
+            await consulta.answer("⏳ Ya lo estoy mandando…")
+            return
+        en_curso.add(ident)
+        try:
+            await consulta.answer("⏳ Mandando a Folio…")
+            await consulta.edit_message_text(texto + "\n\n⏳ _Mandando a Folio…_", parse_mode=ParseMode.MARKDOWN)
+            try:
+                await asyncio.to_thread(bandeja.dejar_varios, perfil, apuntes)
+            except Exception:
+                log.exception("No se ha podido escribir en la bandeja")
+                await consulta.edit_message_text(texto + "\n\n⚠️ No he podido dejarlo en Drive. ¿Está montado? Vuelve a pulsar.",
+                                                 parse_mode=ParseMode.MARKDOWN, reply_markup=volver)
+                return
+            enviados[ident] = {"perfil": perfil}
+            grupos.pop(ident, None)
+            esperando.pop(ident, None)
+            await consulta.edit_message_text(texto + "\n\n✅ En la bandeja de Folio. Lo aceptas en el Historial.",
+                                             parse_mode=ParseMode.MARKDOWN)
+        finally:
+            en_curso.discard(ident)
+
     async def boton(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         consulta = update.callback_query
-        await consulta.answer()
         if permitido(update) is None:
+            await consulta.answer()
             return
         accion, _, resto = (consulta.data or "").partition(":")
         ident, _, extra = resto.partition(":")
@@ -323,23 +360,18 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
         if accion in ("gok", "guno", "gno"):
             grupo = grupos.get(ident)
             if grupo is None:
-                await consulta.edit_message_text("Esto ha caducado (el bot se ha reiniciado). Mándamelo otra vez.")
+                # Ya mandado, descartado o muy viejo: se dice con un aviso y el mensaje no se toca.
+                await consulta.answer("✅ Ya está en la bandeja de Folio." if enviados.get(ident)
+                                      else "Esto ya no está pendiente.")
                 return
+            if accion == "gok":
+                await mandar(consulta, ident, grupo["perfil"], grupo["apuntes"], resumen_varios(grupo["apuntes"]),
+                             botones_grupo(ident, len(grupo["apuntes"])))
+                return
+            await consulta.answer()
             if accion == "gno":
                 grupos.pop(ident, None)
                 await consulta.edit_message_text("Descartados. No llega nada a Folio.")
-            elif accion == "gok":
-                try:
-                    for a in grupo["apuntes"]:
-                        bandeja.dejar(grupo["perfil"], a)
-                except Exception:
-                    log.exception("No se ha podido escribir en la bandeja")
-                    await consulta.edit_message_text("No he podido dejarlos en Drive. ¿Está montado? Vuelve a intentarlo.",
-                                                     reply_markup=botones_grupo(ident, len(grupo["apuntes"])))
-                    return
-                grupos.pop(ident, None)
-                await consulta.edit_message_text(resumen_varios(grupo["apuntes"]) + "\n\n✅ En la bandeja de Folio.",
-                                                 parse_mode=ParseMode.MARKDOWN)
             else:  # uno a uno: cada apunte en su mensaje, con sus botones
                 grupos.pop(ident, None)
                 await consulta.edit_message_text(f"Te los paso uno a uno ({len(grupo['apuntes'])}):")
@@ -352,23 +384,17 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
         # ── Uno suelto ──
         pendiente = esperando.get(ident)
         if pendiente is None:
-            await consulta.edit_message_text("Este apunte ha caducado (el bot se ha reiniciado). Mándamelo otra vez.")
+            await consulta.answer("✅ Ya está en la bandeja de Folio." if enviados.get(ident)
+                                  else "Este apunte ya no está pendiente.")
             return
         apunte = pendiente["apunte"]
-        arbol = bandeja.contexto(pendiente["perfil"]).get("categorias") or {}
-
         if accion == "ok":
-            try:
-                bandeja.dejar(pendiente["perfil"], apunte)
-            except Exception:
-                log.exception("No se ha podido escribir en la bandeja")
-                await consulta.edit_message_text("No he podido dejarlo en Drive. ¿Está montado? Vuelve a intentarlo.",
-                                                 reply_markup=botones(ident))
-                return
-            esperando.pop(ident, None)
-            await consulta.edit_message_text(resumen(apunte) + "\n\n✅ En la bandeja de Folio. Lo aceptas en el Historial.",
-                                             parse_mode=ParseMode.MARKDOWN)
-        elif accion == "no":
+            await mandar(consulta, ident, pendiente["perfil"], [apunte], resumen(apunte), botones(ident))
+            return
+        await consulta.answer()
+        arbol = (await asyncio.to_thread(bandeja.contexto, pendiente["perfil"])).get("categorias") or {}
+
+        if accion == "no":
             esperando.pop(ident, None)
             await consulta.edit_message_text("Descartado. No llega nada a Folio.")
         elif accion == "tipo":
@@ -381,9 +407,11 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             tipos = interprete.TIPOS_CARTERA
             if extra.isdigit() and int(extra) < len(tipos):
                 apunte["tipo"] = tipos[int(extra)]
+                esperando.guardar()
             await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.MARKDOWN, reply_markup=botones(ident))
         elif accion == "signo":
             apunte["importe"] = -apunte["importe"]
+            esperando.guardar()
             await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.MARKDOWN, reply_markup=botones(ident))
         elif accion == "cat":
             # Primero la categoría; si tiene subcategorías, después la subcategoría.
@@ -396,6 +424,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             nombres = sorted(arbol)
             cat = nombres[int(extra)] if extra.isdigit() and int(extra) < len(nombres) else ""
             apunte.update(categoria=cat, categoria2="", categoria3="")
+            esperando.guardar()
             subs = sorted(arbol.get(cat) or {})
             if not subs:
                 await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.MARKDOWN, reply_markup=botones(ident))
@@ -408,11 +437,13 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             subs = sorted(arbol.get(apunte["categoria"]) or {})
             if extra.isdigit() and int(extra) < len(subs):
                 apunte.update(categoria2=subs[int(extra)], categoria3="")
+                esperando.guardar()
             await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.MARKDOWN, reply_markup=botones(ident))
         else:  # «ver»: vuelve al resumen
             await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.MARKDOWN, reply_markup=botones(ident))
 
-    app = Application.builder().token(token).build()
+    # Varias cosas a la vez: un botón se atiende aunque haya un audio procesándose.
+    app = Application.builder().token(token).concurrent_updates(True).build()
     app.add_handler(CommandHandler(["start", "ayuda"], empezar))
     app.add_handler(CommandHandler(["stats", "coste"], stats))
     app.add_handler(CallbackQueryHandler(boton))

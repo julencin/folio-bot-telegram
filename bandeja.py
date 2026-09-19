@@ -71,6 +71,23 @@ class Bandeja:
 
     # ── Dejar un apunte ────────────────────────────────────────────────────
 
+    def dejar_varios(self, perfil: str, apuntes: list[dict[str, Any]]) -> list[str]:
+        """
+        Varios de una vez. Con rclone es **una sola** subida para todos (cada `rclone`
+        tarda unos segundos en arrancar: ocho de uno en uno eran casi un minuto).
+        """
+        if self.carpeta is not None or len(apuntes) <= 1:
+            return [self.dejar(perfil, a) for a in apuntes]
+        with tempfile.TemporaryDirectory() as tmp:
+            nombres = []
+            for a in apuntes:
+                nombre = f"{a['fecha']}-{a['id']}.json"
+                (Path(tmp) / nombre).write_text(json.dumps(a, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+                nombres.append(nombre)
+            subprocess.run(["rclone", "copy", tmp, f"{self.remoto}/{_seguro(perfil)}/entrantes"], check=True,
+                           capture_output=True, timeout=180)
+        return nombres
+
     def dejar(self, perfil: str, apunte: dict[str, Any]) -> str:
         """Deja el apunte en `entrantes/`. Devuelve el nombre del fichero."""
         nombre = f"{apunte['fecha']}-{apunte['id']}.json"
