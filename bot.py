@@ -19,15 +19,14 @@ Configuración: variables de entorno o un `.env` al lado de este fichero (ver .e
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 from .bandeja import Bandeja
-from . import interprete, precios
+from . import estadisticas, interprete, precios
 
 AQUI = Path(__file__).resolve().parent
 log = logging.getLogger("folio.bot")
@@ -98,23 +97,15 @@ def resumen_varios(apuntes: list[dict[str, Any]], hoy: date | None = None) -> st
     return "\n".join(lineas)
 
 
-# ── Gasto acumulado del bot (para /coste) ──────────────────────────────────
+# ── Lo que lleva gastado el bot (para /stats) ──────────────────────────────
+
+RUTA_STATS = AQUI / "coste.json"
 
 
-def _apuntar_coste(dolares: float | None) -> None:
-    if dolares is None:
-        return
-    ruta = AQUI / "coste.json"
-    try:
-        datos = json.loads(ruta.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        datos = {}
-    mes = datetime.now().strftime("%Y-%m")
-    fila = datos.get(mes) or {"mensajes": 0, "dolares": 0.0}
-    fila["mensajes"] += 1
-    fila["dolares"] = round(fila["dolares"] + dolares, 6)
-    datos[mes] = fila
-    ruta.write_text(json.dumps(datos, indent=1), encoding="utf-8")
+def _apuntar_coste(dolares: float | None, tipo: str = "texto", perfil: str = "", apuntes: int = 0) -> None:
+    datos = estadisticas.leer(RUTA_STATS)
+    estadisticas.apuntar(datos, dolares or 0.0, tipo, perfil, apuntes)
+    estadisticas.guardar(RUTA_STATS, datos)
 
 
 # ── El bot ─────────────────────────────────────────────────────────────────
@@ -173,24 +164,19 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             "· «15 € en un bar»\n· «ayer 37 de gasolina con la VISA»\n"
             "· las cuentas de la semana de una tirada: «el lunes 40 de gasolina, el martes 12 en el Mercadona…»\n"
             "· una 🎙️ nota de voz\n· la 📷 foto del ticket\n\n"
-            "Te enseño cómo lo he entendido y, si le das a ✅, llega a la bandeja de Folio."
+            "Te enseño cómo lo he entendido y, si le das a ✅, llega a la bandeja de Folio.\n\n"
+            "/stats te dice cuánto llevo gastado en OpenAI."
         )
 
-    async def coste(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Cuánto lleva gastado el bot y cuántos mensajes ha recibido: hoy, este mes y siempre."""
         if permitido(update) is None:
             return
-        try:
-            datos = json.loads((AQUI / "coste.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            datos = {}
-        fila = datos.get(datetime.now().strftime("%Y-%m")) or {"mensajes": 0, "dolares": 0.0}
-        await update.message.reply_text(
-            f"Este mes: {fila['mensajes']} mensajes, unos {precios.en_centimos(fila['dolares'])} "
-            f"con {modelo} (precios de OpenAI revisados el {precios.REVISADO})."
-        )
+        await update.message.reply_text(estadisticas.texto(estadisticas.leer(RUTA_STATS), modelo),
+                                        parse_mode=ParseMode.MARKDOWN)
 
     async def entender(update: Update, ctx: ContextTypes.DEFAULT_TYPE, frase: str, imagen: bytes | None = None,
-                       extra_dolares: float = 0.0, transcripcion: str = "") -> None:
+                       extra_dolares: float = 0.0, transcripcion: str = "", tipo: str = "texto") -> None:
         """Lo común a texto, voz y foto: GPT, y enseñar lo entendido con sus botones."""
         perfil = permitido(update)
         if perfil is None:
@@ -208,7 +194,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             await update.message.reply_text("No he podido entenderlo ahora mismo (OpenAI no responde). Prueba en un rato.")
             return
         dolares = (resultado.coste_dolares or 0.0) + extra_dolares
-        _apuntar_coste(dolares)
+        _apuntar_coste(dolares, tipo, perfil, len(resultado.apuntes))
         cabeza = f"🎙️ _«{transcripcion}»_\n\n" if transcripcion else ""
         pie = ""
         if resultado.duda:
@@ -216,7 +202,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
         elif resultado.dudoso:
             pie += "\n\n_Alguna categoría o fecha la he supuesto: míralo antes de mandarlo._"
         if mostrar_coste:
-            pie += f"\n\n`{precios.en_centimos(dolares)}`"
+            pie += f"\n\n`Coste: {estadisticas.euros(dolares)}`"
 
         if not resultado.apuntes:
             await update.message.reply_text(cabeza + (resultado.duda or "No he visto ningún gasto."),
@@ -255,7 +241,8 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
         if not frase:
             await update.message.reply_text("No he entendido nada en la nota. ¿Me la repites?")
             return
-        await entender(update, ctx, frase, extra_dolares=precios.coste_voz(nota.duration or 0), transcripcion=frase)
+        await entender(update, ctx, frase, extra_dolares=precios.coste_voz(nota.duration or 0), transcripcion=frase,
+                       tipo="voz")
 
     async def foto(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if permitido(update) is None or not update.message:
@@ -268,7 +255,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             return
         await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         imagen = bytes(await fichero.download_as_bytearray())
-        await entender(update, ctx, update.message.caption or "", imagen=imagen)
+        await entender(update, ctx, update.message.caption or "", imagen=imagen, tipo="foto")
 
     async def boton(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         consulta = update.callback_query
@@ -362,7 +349,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "ayuda"], empezar))
-    app.add_handler(CommandHandler("coste", coste))
+    app.add_handler(CommandHandler(["stats", "coste"], stats))
     app.add_handler(CallbackQueryHandler(boton))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voz))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, foto))
