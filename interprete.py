@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -40,6 +41,14 @@ from typing import Any
 from . import precios
 
 DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+
+
+def cuenta_a_medias() -> str:
+    """
+    La cuenta de lo que se paga a medias: siempre la misma (la común de la casa). Se
+    cambia con FOLIO_CUENTA_A_MEDIAS en el .env; vacío, no se fuerza ninguna.
+    """
+    return os.environ.get("FOLIO_CUENTA_A_MEDIAS", "Revolut").strip()
 MODELO_VOZ = "gpt-4o-mini-transcribe"
 
 INSTRUCCIONES = """Eres el asistente de Folio, una app de finanzas personales en castellano.
@@ -89,7 +98,8 @@ Cada movimiento:
 - cuenta: la que diga («con la VISA», «en efectivo») si está en su lista; si no dice nada, la habitual.
 - fecha: AAAA-MM-DD. Hoy si no dice nada. Entiende «ayer», «anteayer», «el lunes», «el viernes
   pasado», «el 3» usando el calendario de los últimos días que se te da. Nunca una fecha futura.
-- compartido: true si dice «a medias», «entre los dos», «lo pagamos juntos» o similar.
+- compartido: true si dice «a medias», «entre los dos», «lo pagamos juntos» o similar. Lo que es
+  a medias va siempre a la cuenta común (se pone sola).
 - confianza: «alta» si lo tienes claro, «media» si has tenido que suponer la categoría o la
   fecha, «baja» si dudas mucho (un ticket que no se lee bien, por ejemplo).
 
@@ -350,6 +360,11 @@ def _uno(bruto: dict[str, Any], contexto: dict[str, Any], hoy: date, texto: str,
     cuenta = str(bruto.get("cuenta") or "")
     if cuenta not in cuentas:
         cuenta = contexto.get("cuenta_habitual") or ""
+    # Lo que es a medias sale siempre de la cuenta común, diga lo que diga GPT. Con su
+    # nombre tal cual esté en tu lista («REVOLUT», «Revolut»…), o como está puesto si no hay lista.
+    comun = cuenta_a_medias()
+    if bruto.get("compartido") and comun:
+        cuenta = next((c for c in cuentas if c.strip().lower() == comun.lower()), comun if not cuentas else cuenta)
 
     try:
         fecha = date.fromisoformat(str(bruto.get("fecha") or ""))
