@@ -45,7 +45,6 @@ def leer(ruta: Path) -> dict[str, Any]:
         nuevo["meses"][mes] = m
         nuevo["total"]["mensajes"] += m["mensajes"]
         nuevo["total"]["dolares"] += m["dolares"]
-        nuevo["desde"] = nuevo["desde"] or f"{mes}-01"
     return nuevo
 
 
@@ -82,13 +81,17 @@ def guardar(ruta: Path, datos: dict[str, Any]) -> None:
 def euros(dolares: float) -> str:
     """En euros, con los decimales que hagan falta para que no salga «0,00 €»."""
     valor = dolares * precios.EUROS_POR_DOLAR
+    if valor <= 0:
+        return "0 €"
     decimales = 2 if valor >= 1 else 3 if valor >= 0.1 else 4
     return f"{valor:,.{decimales}f}".replace(",", "X").replace(".", ",").replace("X", ".") + " €"
 
 
 def _linea(nombre: str, fila: dict[str, Any] | None) -> str:
     fila = fila or _fila()
-    return f"*{nombre}:* {euros(fila['dolares'])} · {fila['mensajes']} mensajes · {fila.get('apuntes', 0)} apuntes"
+    m, a = fila["mensajes"], fila.get("apuntes", 0)
+    return (f"*{nombre}:* {euros(fila['dolares'])} · {m} {'mensaje' if m == 1 else 'mensajes'}"
+            f" · {a} {'apunte' if a == 1 else 'apuntes'}")
 
 
 def texto(datos: dict[str, Any], modelo: str, nombres: dict[str, str] | None = None,
@@ -97,6 +100,8 @@ def texto(datos: dict[str, Any], modelo: str, nombres: dict[str, str] | None = N
     total = datos["total"]
     tipos = total.get("tipos") or {}
     mensajes = max(1, total["mensajes"])
+    #  Los de antes de /stats solo se guardaban por mes: sin día, tipo, persona ni apuntes.
+    sin_detalle = total["mensajes"] - sum(tipos.get(t, 0) for t in TIPOS)
     lineas = [
         "📊 *Lo que lleva el bot*",
         "",
@@ -107,11 +112,18 @@ def texto(datos: dict[str, Any], modelo: str, nombres: dict[str, str] | None = N
         f"Por mensaje, de media: {euros(total['dolares'] / mensajes)}",
         f"Recibidos: {tipos.get('texto', 0)} textos · {tipos.get('voz', 0)} notas de voz · {tipos.get('foto', 0)} fotos",
     ]
+    if sin_detalle > 0:
+        lineas.append(f"_Y {sin_detalle} de antes de /stats: cuentan en el mes y en el total, pero no se "
+                      "guardó ni el día, ni el tipo, ni los apuntes._")
     perfiles = {p: f for p, f in (datos.get("perfiles") or {}).items() if p != "?"}
     if len(perfiles) > 1:
         lineas.append("")
         lineas += [_linea((nombres or {}).get(p, p.capitalize()), f) for p, f in sorted(perfiles.items())]
-    lineas += ["", f"_Modelo {modelo}. Precios oficiales de OpenAI del {precios.REVISADO}, a {precios.EUROS_POR_DOLAR} € el dólar._"]
-    if datos.get("desde"):
-        lineas.append(f"_Contando desde el {datetime.fromisoformat(datos['desde']).strftime('%d/%m/%Y')}._")
+    revisado = datetime.fromisoformat(precios.REVISADO).strftime("%d/%m/%Y")
+    cambio = f"{precios.EUROS_POR_DOLAR}".replace(".", ",")
+    lineas += ["", f"_Modelo {modelo}. Precios oficiales de OpenAI del {revisado}, a {cambio} € el dólar._"]
+    #  «Desde» es el primer día con datos de verdad, no el que se supuso al convertir.
+    primero = min(datos["dias"]) if datos.get("dias") else None
+    if primero:
+        lineas.append(f"_Con detalle desde el {datetime.fromisoformat(primero).strftime('%d/%m/%Y')}._")
     return "\n".join(lineas)
