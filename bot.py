@@ -1,6 +1,11 @@
 """
 El bot de Telegram de Folio: le cuentas lo que gastas y el apunte llega a Folio.
 
+Los mensajes van en HTML, no en Markdown, y todo lo que viene de fuera (un concepto, el
+nombre de un activo, lo que dictaste) pasa por `escape`. Con Markdown, un concepto del
+banco como «PAGO_TARJETA *4321» dejaba el formato a medias y Telegram rechazaba el
+mensaje entero: no llegaba nada y parecía que el bot no contestaba.
+
     Tú (Telegram)      «ayer 37 de gasolina», una nota de voz o la foto del ticket
     Bot + OpenAI       −37,00 € · Gasolina · Transporte › Gasolina · IMAGIN · ayer
                        [✅ A Folio] [🏷️ Categoría] [± Signo] [✖]
@@ -26,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from html import escape
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -102,8 +108,8 @@ def _dinero(valor: float, divisa: str = "EUR") -> str:
 def resumen_cartera(op: dict[str, Any], hoy: date | None = None) -> str:
     hoy = hoy or date.today()
     signo = interprete.SIGNO_CARTERA.get(op["tipo"], 0)
-    cabeza = (f"{ICONOS_CARTERA.get(op['tipo'], '📈')} *{op['tipo'].capitalize()}* · {op['activo']}"
-              + (" _(nuevo)_" if op.get("nuevo") else ""))
+    cabeza = (f"{ICONOS_CARTERA.get(op['tipo'], '📈')} <b>{escape(op['tipo'].capitalize())}</b> · {escape(op['activo'])}"
+              + (" <i>(nuevo)</i>" if op.get("nuevo") else ""))
     partes = []
     if op["importe"]:
         partes.append(("−" if signo < 0 else "+" if signo > 0 else "") + _dinero(op["importe"], "EUR" if op["divisa"] == "EUR" else op["divisa"]))
@@ -112,7 +118,7 @@ def resumen_cartera(op: dict[str, Any], hoy: date | None = None) -> str:
     if op["comision"]:
         partes.append(f"comisión {_dinero(op['comision'], op['divisa'])}")
     partes += [op["cuenta"] or "sin bróker", _cuando(op["fecha"], hoy)]
-    return f"{cabeza}\n" + " · ".join(partes) + "\n_A la Cartera_"
+    return f"{cabeza}\n" + " · ".join(escape(p) for p in partes) + "\n<i>A la Cartera</i>"
 
 
 def resumen(apunte: dict[str, Any], hoy: date | None = None) -> str:
@@ -123,29 +129,30 @@ def resumen(apunte: dict[str, Any], hoy: date | None = None) -> str:
     partes = [ruta or "sin categoría", apunte["cuenta"] or "sin cuenta", _cuando(apunte["fecha"], hoy)]
     if apunte.get("compartido"):
         partes.append("a medias")
-    return f"{'🟢' if apunte['importe'] > 0 else '🟠'} *{_euros(apunte['importe'])}* · {apunte['concepto']}\n" + " · ".join(partes)
+    return (f"{'🟢' if apunte['importe'] > 0 else '🟠'} <b>{_euros(apunte['importe'])}</b> · {escape(apunte['concepto'])}\n"
+            + " · ".join(escape(p) for p in partes))
 
 
 def resumen_varios(apuntes: list[dict[str, Any]], hoy: date | None = None) -> str:
     hoy = hoy or date.today()
-    lineas = [f"*{len(apuntes)} apuntes:*"]
+    lineas = [f"<b>{len(apuntes)} apuntes:</b>"]
     for n, a in enumerate(apuntes, 1):
         if a.get("clase") == "cartera":
             signo = interprete.SIGNO_CARTERA.get(a["tipo"], 0)
             dinero = (("−" if signo < 0 else "+" if signo > 0 else "") + _dinero(a["importe"], a["divisa"])) if a["importe"] else ""
-            lineas.append(f"{n}. {ICONOS_CARTERA.get(a['tipo'], '📈')} {a['tipo']} · {a['activo']}"
+            lineas.append(f"{n}. {ICONOS_CARTERA.get(a['tipo'], '📈')} {escape(a['tipo'])} · {escape(a['activo'])}"
                           + (f" · {dinero}" if dinero else "") + f" · {_cuando(a['fecha'], hoy)}")
             continue
         ruta = " › ".join(x for x in (a["categoria"], a["categoria2"]) if x) or "sin categoría"
-        lineas.append(f"{n}. {_euros(a['importe'])} · {a['concepto']} · {ruta} · {_cuando(a['fecha'], hoy)}"
+        lineas.append(f"{n}. {_euros(a['importe'])} · {escape(a['concepto'])} · {escape(ruta)} · {_cuando(a['fecha'], hoy)}"
                       + (" · a medias" if a.get("compartido") else ""))
     gastos = [a for a in apuntes if a.get("clase") != "cartera"]
     if len(gastos) > 1:
-        lineas.append(f"\nGastos e ingresos: *{_euros(sum(a['importe'] for a in gastos))}*")
+        lineas.append(f"\nGastos e ingresos: <b>{_euros(sum(a['importe'] for a in gastos))}</b>")
     return "\n".join(lineas)
 
 
-AYUDA = """*Lo que sé hacer*
+AYUDA = """<b>Lo que sé hacer</b>
 
 Mándame lo que gastas o lo que te entra, como te salga:
 · «15 € en un bar» · «ayer 37 de gasolina con la VISA»
@@ -156,7 +163,7 @@ Mándame lo que gastas o lo que te entra, como te salga:
 
 Te enseño lo que he entendido y, con ✅, va a la bandeja de Folio. Lo aceptas allí.
 
-*Comandos*
+<b>Comandos</b>
 /movimientos — los últimos gastos apuntados en Folio y por dónde ibas
 /stats — lo que llevo gastado en OpenAI: hoy, este mes y siempre
 /recargar — releer tus categorías y cuentas ahora mismo (si las acabas de cambiar)
@@ -171,20 +178,20 @@ def texto_ultimos(datos: dict[str, Any], hoy: date | None = None) -> str:
         return "En Folio no hay ningún movimiento todavía."
     ultimo = date.fromisoformat(movimientos[0]["fecha"])
     dias = (hoy - ultimo).days
-    cabeza = (f"🗓️ *Lo último apuntado es del {ultimo.strftime('%d/%m/%Y')}*"
+    cabeza = (f"🗓️ <b>Lo último apuntado es del {ultimo.strftime('%d/%m/%Y')}</b>"
               + ("" if dias <= 0 else f", hace {dias} {'día' if dias == 1 else 'días'}"))
     lineas = [cabeza, ""]
     dia_visto = ""
     for m in movimientos:
         if m["fecha"] != dia_visto:
             dia_visto = m["fecha"]
-            lineas.append(f"*{_cuando(m['fecha'], hoy).capitalize()}*")
+            lineas.append(f"<b>{_cuando(m['fecha'], hoy).capitalize()}</b>")
         ruta = " › ".join(x for x in (m.get("categoria"), m.get("categoria2")) if x) or "sin categoría"
-        lineas.append(f"· {_euros(m['importe'])} · {m['concepto'] or 'sin concepto'} · {ruta}"
+        lineas.append(f"· {_euros(m['importe'])} · {escape(m['concepto'] or 'sin concepto')} · {escape(ruta)}"
                       + (" · a medias" if m.get("compartido") else ""))
     if datos.get("esperando"):
         n = datos["esperando"]
-        lineas += ["", f"_Y {n} {'apunte espera' if n == 1 else 'apuntes esperan'} en la bandeja de Folio._"]
+        lineas += ["", f"<i>Y {n} {'apunte espera' if n == 1 else 'apuntes esperan'} en la bandeja de Folio.</i>"]
     return "\n".join(lineas)
 
 
@@ -274,7 +281,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
     async def ayuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if permitido(update) is None:
             return
-        await update.message.reply_text(AYUDA, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(AYUDA, parse_mode=ParseMode.HTML)
 
     async def movimientos(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Los últimos gastos apuntados en Folio, para no repetir ni dejarte días sueltos."""
@@ -291,7 +298,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             log.exception("No se han podido leer los últimos movimientos")
             await update.message.reply_text("No he podido mirarlo en Drive ahora mismo. Prueba en un rato.")
             return
-        await update.message.reply_text(texto_ultimos(datos), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(texto_ultimos(datos), parse_mode=ParseMode.HTML)
 
     async def recargar(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Releer categorías y cuentas sin esperar a que caduque la copia (5 min)."""
@@ -315,7 +322,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
         if permitido(update) is None:
             return
         await update.message.reply_text(estadisticas.texto(estadisticas.leer(RUTA_STATS), modelo),
-                                        parse_mode=ParseMode.MARKDOWN)
+                                        parse_mode=ParseMode.HTML)
 
     async def entender(update: Update, ctx: ContextTypes.DEFAULT_TYPE, frase: str, imagen: bytes | None = None,
                        extra_dolares: float = 0.0, transcripcion: str = "", tipo: str = "texto") -> None:
@@ -337,28 +344,28 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             return
         dolares = (resultado.coste_dolares or 0.0) + extra_dolares
         _apuntar_coste(dolares, tipo, perfil, len(resultado.apuntes))
-        cabeza = f"🎙️ _«{transcripcion}»_\n\n" if transcripcion else ""
+        cabeza = f"🎙️ <i>«{escape(transcripcion)}»</i>\n\n" if transcripcion else ""
         pie = ""
         if resultado.duda:
-            pie += f"\n\n_{resultado.duda}_"
+            pie += f"\n\n<i>{escape(resultado.duda)}</i>"
         elif resultado.dudoso:
-            pie += "\n\n_Alguna categoría o fecha la he supuesto: míralo antes de mandarlo._"
+            pie += "\n\n<i>Alguna categoría o fecha la he supuesto: míralo antes de mandarlo.</i>"
         if mostrar_coste:
-            pie += f"\n\n`Coste: {estadisticas.euros(dolares)}`"
+            pie += f"\n\n<code>Coste: {estadisticas.euros(dolares)}</code>"
 
         if not resultado.apuntes:
-            await update.message.reply_text(cabeza + (resultado.duda or "No he visto ningún gasto."),
-                                            parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(cabeza + escape(resultado.duda or "No he visto ningún gasto."),
+                                            parse_mode=ParseMode.HTML)
             return
         if len(resultado.apuntes) == 1:
             apunte = resultado.apuntes[0]
             esperando[apunte["id"]] = {"perfil": perfil, "apunte": apunte}
-            await update.message.reply_text(cabeza + resumen(apunte) + pie, parse_mode=ParseMode.MARKDOWN,
+            await update.message.reply_text(cabeza + resumen(apunte) + pie, parse_mode=ParseMode.HTML,
                                             reply_markup=botones(apunte["id"]))
             return
         gid = resultado.apuntes[0]["id"]
         grupos[gid] = {"perfil": perfil, "apuntes": resultado.apuntes}
-        await update.message.reply_text(cabeza + resumen_varios(resultado.apuntes) + pie, parse_mode=ParseMode.MARKDOWN,
+        await update.message.reply_text(cabeza + resumen_varios(resultado.apuntes) + pie, parse_mode=ParseMode.HTML,
                                         reply_markup=botones_grupo(gid, len(resultado.apuntes)))
 
     async def texto(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -414,19 +421,19 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
         en_curso.add(ident)
         try:
             await consulta.answer("⏳ Mandando a Folio…")
-            await consulta.edit_message_text(texto + "\n\n⏳ _Mandando a Folio…_", parse_mode=ParseMode.MARKDOWN)
+            await consulta.edit_message_text(texto + "\n\n⏳ <i>Mandando a Folio…</i>", parse_mode=ParseMode.HTML)
             try:
                 await asyncio.to_thread(bandeja.dejar_varios, perfil, apuntes)
             except Exception:
                 log.exception("No se ha podido escribir en la bandeja")
                 await consulta.edit_message_text(texto + "\n\n⚠️ No he podido dejarlo en Drive. ¿Está montado? Vuelve a pulsar.",
-                                                 parse_mode=ParseMode.MARKDOWN, reply_markup=volver)
+                                                 parse_mode=ParseMode.HTML, reply_markup=volver)
                 return
             enviados[ident] = {"perfil": perfil}
             grupos.pop(ident, None)
             esperando.pop(ident, None)
             await consulta.edit_message_text(texto + "\n\n✅ En la bandeja de Folio. Lo aceptas en el Historial.",
-                                             parse_mode=ParseMode.MARKDOWN)
+                                             parse_mode=ParseMode.HTML)
         finally:
             en_curso.discard(ident)
 
@@ -459,7 +466,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
                 await consulta.edit_message_text(f"Te los paso uno a uno ({len(grupo['apuntes'])}):")
                 for a in grupo["apuntes"]:
                     esperando[a["id"]] = {"perfil": grupo["perfil"], "apunte": a}
-                    await ctx.bot.send_message(update.effective_chat.id, resumen(a), parse_mode=ParseMode.MARKDOWN,
+                    await ctx.bot.send_message(update.effective_chat.id, resumen(a), parse_mode=ParseMode.HTML,
                                                reply_markup=botones(a["id"]))
             return
 
@@ -490,11 +497,11 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             if extra.isdigit() and int(extra) < len(tipos):
                 apunte["tipo"] = tipos[int(extra)]
                 esperando.guardar()
-            await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.MARKDOWN, reply_markup=botones(ident))
+            await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.HTML, reply_markup=botones(ident))
         elif accion == "signo":
             apunte["importe"] = -apunte["importe"]
             esperando.guardar()
-            await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.MARKDOWN, reply_markup=botones(ident))
+            await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.HTML, reply_markup=botones(ident))
         elif accion == "cat":
             # Primero la categoría; si tiene subcategorías, después la subcategoría.
             nombres = sorted(arbol)
@@ -509,7 +516,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             esperando.guardar()
             subs = sorted(arbol.get(cat) or {})
             if not subs:
-                await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.MARKDOWN, reply_markup=botones(ident))
+                await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.HTML, reply_markup=botones(ident))
                 return
             filas = [[InlineKeyboardButton(n, callback_data=f"c2:{ident}:{i}") for i, n in list(enumerate(subs))[j:j + 2]]
                      for j in range(0, len(subs), 2)]
@@ -520,9 +527,16 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             if extra.isdigit() and int(extra) < len(subs):
                 apunte.update(categoria2=subs[int(extra)], categoria3="")
                 esperando.guardar()
-            await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.MARKDOWN, reply_markup=botones(ident))
+            await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.HTML, reply_markup=botones(ident))
         else:  # «ver»: vuelve al resumen
-            await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.MARKDOWN, reply_markup=botones(ident))
+            await consulta.edit_message_text(resumen(apunte), parse_mode=ParseMode.HTML, reply_markup=botones(ident))
+
+    async def alFallar(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Si algo revienta, se dice; antes el mensaje se perdía y parecía que el bot no contestaba."""
+        log.exception("Algo ha fallado atendiendo un mensaje", exc_info=ctx.error)
+        chat = getattr(getattr(update, "effective_chat", None), "id", None)
+        if chat:
+            await ctx.bot.send_message(chat, "Uf, algo me ha fallado con eso. Mira el registro del bot o inténtalo otra vez.")
 
     # Varias cosas a la vez: un botón se atiende aunque haya un audio procesándose.
     app = Application.builder().token(token).concurrent_updates(True).build()
@@ -535,6 +549,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voz))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, foto))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, texto))
+    app.add_error_handler(alFallar)
     log.info("Folio bot en marcha con %s para %d usuarios", modelo, len(quienes))
     app.run_polling()
 

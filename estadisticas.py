@@ -90,7 +90,7 @@ def euros(dolares: float) -> str:
 def _linea(nombre: str, fila: dict[str, Any] | None) -> str:
     fila = fila or _fila()
     m, a = fila["mensajes"], fila.get("apuntes", 0)
-    return (f"*{nombre}:* {euros(fila['dolares'])} · {m} {'mensaje' if m == 1 else 'mensajes'}"
+    return (f"<b>{nombre}:</b> {euros(fila['dolares'])} · {m} {'mensaje' if m == 1 else 'mensajes'}"
             f" · {a} {'apunte' if a == 1 else 'apuntes'}")
 
 
@@ -103,7 +103,7 @@ def texto(datos: dict[str, Any], modelo: str, nombres: dict[str, str] | None = N
     #  Los de antes de /stats solo se guardaban por mes: sin día, tipo, persona ni apuntes.
     sin_detalle = total["mensajes"] - sum(tipos.get(t, 0) for t in TIPOS)
     lineas = [
-        "📊 *Lo que lleva el bot*",
+        "📊 <b>Lo que lleva el bot</b>",
         "",
         _linea("Hoy", datos["dias"].get(cuando.strftime("%Y-%m-%d"))),
         _linea("Este mes", datos["meses"].get(cuando.strftime("%Y-%m"))),
@@ -113,17 +113,17 @@ def texto(datos: dict[str, Any], modelo: str, nombres: dict[str, str] | None = N
         f"Recibidos: {tipos.get('texto', 0)} textos · {tipos.get('voz', 0)} notas de voz · {tipos.get('foto', 0)} fotos",
     ]
     if sin_detalle > 0:
-        lineas.append(f"_Y {sin_detalle} de antes de /stats: cuentan en el mes y en el total, pero no se "
-                      "guardó ni el día, ni el tipo, ni los apuntes._")
+        lineas.append(f"<i>Y {sin_detalle} de antes de /stats: cuentan en el mes y en el total, pero no se "
+                      "guardó ni el día, ni el tipo, ni los apuntes.</i>")
     perfiles = {p: f for p, f in (datos.get("perfiles") or {}).items() if p != "?"}
     if len(perfiles) > 1:
         lineas.append("")
         lineas += [_linea((nombres or {}).get(p, p.capitalize()), f) for p, f in sorted(perfiles.items())]
     revisado = datetime.fromisoformat(precios.REVISADO).strftime("%d/%m/%Y")
     cambio = f"{precios.EUROS_POR_DOLAR}".replace(".", ",")
-    lineas += ["", f"_Modelo {modelo}. Precios oficiales de OpenAI del {revisado}, a {cambio} € el dólar._"]
+    lineas += ["", f"<i>Modelo {modelo}. Precios oficiales de OpenAI del {revisado}, a {cambio} € el dólar.</i>"]
     #  «Desde» es el primer día con datos de verdad, no el que se supuso al convertir.
     primero = min(datos["dias"]) if datos.get("dias") else None
     if primero:
-        lineas.append(f"_Con detalle desde el {datetime.fromisoformat(primero).strftime('%d/%m/%Y')}._")
+        lineas.append(f"<i>Con detalle desde el {datetime.fromisoformat(primero).strftime('%d/%m/%Y')}.</i>")
     return "\n".join(lineas)
