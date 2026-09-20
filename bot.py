@@ -171,28 +171,51 @@ Te enseño lo que he entendido y, con ✅, va a la bandeja de Folio. Lo aceptas 
 
 
 def texto_ultimos(datos: dict[str, Any], hoy: date | None = None) -> str:
-    """Los últimos movimientos apuntados en Folio: para saber por dónde ibas."""
+    """
+    Los últimos movimientos apuntados en Folio: para saber por dónde ibas.
+
+    Un día por bloque, con su total, y cada línea con su icono: 🟠 lo que sale, 🟢 lo que
+    entra, 💼 lo de la Cartera y 🤝 lo que va a medias. La categoría, en gris debajo del
+    concepto, que es lo que menos se mira.
+    """
     hoy = hoy or date.today()
     movimientos = datos.get("movimientos") or []
     if not movimientos:
         return "En Folio no hay ningún movimiento todavía."
     ultimo = date.fromisoformat(movimientos[0]["fecha"])
     dias = (hoy - ultimo).days
-    cabeza = (f"🗓️ <b>Lo último apuntado es del {ultimo.strftime('%d/%m/%Y')}</b>"
-              + ("" if dias <= 0 else f", hace {dias} {'día' if dias == 1 else 'días'}"))
-    lineas = [cabeza, ""]
-    dia_visto = ""
+    cuando = "hoy" if dias <= 0 else "ayer" if dias == 1 else f"hace {dias} días"
+    lineas = [f"🗓️ <b>Lo último que tienes apuntado es del {ultimo.strftime('%d/%m/%Y')}</b> ({cuando})", ""]
+
+    por_dia: dict[str, list[dict]] = {}
     for m in movimientos:
-        if m["fecha"] != dia_visto:
-            dia_visto = m["fecha"]
-            lineas.append(f"<b>{_cuando(m['fecha'], hoy).capitalize()}</b>")
-        ruta = " › ".join(x for x in (m.get("categoria"), m.get("categoria2")) if x) or "sin categoría"
-        lineas.append(f"· {_euros(m['importe'])} · {escape(m['concepto'] or 'sin concepto')} · {escape(ruta)}"
-                      + (" · a medias" if m.get("compartido") else ""))
+        por_dia.setdefault(m["fecha"], []).append(m)
+    for fecha, delDia in por_dia.items():
+        dia = date.fromisoformat(fecha)
+        cabecera = ("Hoy" if dia == hoy else "Ayer" if dia == hoy - timedelta(days=1)
+                    else f"{interprete.DIAS[dia.weekday()].capitalize()} "
+                         + dia.strftime("%d/%m" if dia.year == hoy.year else "%d/%m/%Y"))
+        total = sum(m["importe"] for m in delDia)
+        lineas.append(f"<b>{cabecera}</b>  <i>{_euros(total)}</i>")
+        for m in delDia:
+            cartera = m.get("clase") == "cartera"
+            icono = "💼" if cartera else "🟢" if m["importe"] > 0 else "🟠"
+            donde = ("Cartera" if cartera
+                     else " › ".join(x for x in (m.get("categoria"), m.get("categoria2")) if x) or "sin categoría")
+            lineas.append(f"{icono} <b>{_euros(m['importe'])}</b> · {escape(m['concepto'] or 'sin concepto')}"
+                          + (" 🤝" if m.get("compartido") else ""))
+            lineas.append(f"      <i>{escape(donde)}</i>")
+        lineas.append("")
+
+    gastos = [m for m in movimientos if m.get("clase") != "cartera"]
+    inversion = len(movimientos) - len(gastos)
+    pie = f"Son los {len(movimientos)} últimos: {len(gastos)} del día a día"
+    pie += f" y {inversion} de la Cartera." if inversion else "."
+    lineas.append(pie)
     if datos.get("esperando"):
         n = datos["esperando"]
-        lineas += ["", f"<i>Y {n} {'apunte espera' if n == 1 else 'apuntes esperan'} en la bandeja de Folio.</i>"]
-    return "\n".join(lineas)
+        lineas.append(f"📥 <i>Y {n} {'apunte espera' if n == 1 else 'apuntes esperan'} en la bandeja de Folio.</i>")
+    return "\n".join(lineas).strip()
 
 
 # ── Lo que lleva gastado el bot (para /stats) ──────────────────────────────
