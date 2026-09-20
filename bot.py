@@ -145,6 +145,49 @@ def resumen_varios(apuntes: list[dict[str, Any]], hoy: date | None = None) -> st
     return "\n".join(lineas)
 
 
+AYUDA = """*Lo que sé hacer*
+
+Mándame lo que gastas o lo que te entra, como te salga:
+· «15 € en un bar» · «ayer 37 de gasolina con la VISA»
+· varias cosas de una tirada: «el lunes 40 de gasolina, el martes 12 en el Mercadona»
+· una 🎙️ nota de voz
+· la 📷 foto de un ticket, o una captura de la lista de movimientos del banco (una por fila)
+· tu cartera: «he metido 200 € en Bitcoin a 58.000», o la captura de la orden del bróker
+
+Te enseño lo que he entendido y, con ✅, va a la bandeja de Folio. Lo aceptas allí.
+
+*Comandos*
+/movimientos — los últimos gastos apuntados en Folio y por dónde ibas
+/stats — lo que llevo gastado en OpenAI: hoy, este mes y siempre
+/recargar — releer tus categorías y cuentas ahora mismo (si las acabas de cambiar)
+/help — esto"""
+
+
+def texto_ultimos(datos: dict[str, Any], hoy: date | None = None) -> str:
+    """Los últimos movimientos apuntados en Folio: para saber por dónde ibas."""
+    hoy = hoy or date.today()
+    movimientos = datos.get("movimientos") or []
+    if not movimientos:
+        return "En Folio no hay ningún movimiento todavía."
+    ultimo = date.fromisoformat(movimientos[0]["fecha"])
+    dias = (hoy - ultimo).days
+    cabeza = (f"🗓️ *Lo último apuntado es del {ultimo.strftime('%d/%m/%Y')}*"
+              + ("" if dias <= 0 else f", hace {dias} {'día' if dias == 1 else 'días'}"))
+    lineas = [cabeza, ""]
+    dia_visto = ""
+    for m in movimientos:
+        if m["fecha"] != dia_visto:
+            dia_visto = m["fecha"]
+            lineas.append(f"*{_cuando(m['fecha'], hoy).capitalize()}*")
+        ruta = " › ".join(x for x in (m.get("categoria"), m.get("categoria2")) if x) or "sin categoría"
+        lineas.append(f"· {_euros(m['importe'])} · {m['concepto'] or 'sin concepto'} · {ruta}"
+                      + (" · a medias" if m.get("compartido") else ""))
+    if datos.get("esperando"):
+        n = datos["esperando"]
+        lineas += ["", f"_Y {n} {'apunte espera' if n == 1 else 'apuntes esperan'} en la bandeja de Folio._"]
+    return "\n".join(lineas)
+
+
 # ── Lo que lleva gastado el bot (para /stats) ──────────────────────────────
 
 RUTA_STATS = AQUI / "coste.json"
@@ -225,7 +268,46 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             "· una 🎙️ nota de voz\n· la 📷 foto del ticket\n"
             "· tu cartera: «he metido 200 € en Bitcoin a 58.000», o la captura de la orden del bróker\n\n"
             "Te enseño cómo lo he entendido y, si le das a ✅, llega a la bandeja de Folio.\n\n"
-            "/stats te dice cuánto llevo gastado en OpenAI."
+            "/help te cuenta todo lo que sé hacer."
+        )
+
+    async def ayuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if permitido(update) is None:
+            return
+        await update.message.reply_text(AYUDA, parse_mode=ParseMode.MARKDOWN)
+
+    async def movimientos(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Los últimos gastos apuntados en Folio, para no repetir ni dejarte días sueltos."""
+        perfil = permitido(update)
+        if perfil is None:
+            return
+        await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+        try:
+            datos = await asyncio.to_thread(bandeja.ultimos, perfil)
+        except FileNotFoundError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        except Exception:
+            log.exception("No se han podido leer los últimos movimientos")
+            await update.message.reply_text("No he podido mirarlo en Drive ahora mismo. Prueba en un rato.")
+            return
+        await update.message.reply_text(texto_ultimos(datos), parse_mode=ParseMode.MARKDOWN)
+
+    async def recargar(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Releer categorías y cuentas sin esperar a que caduque la copia (5 min)."""
+        perfil = permitido(update)
+        if perfil is None:
+            return
+        bandeja.olvidar(perfil)
+        try:
+            contexto = await asyncio.to_thread(bandeja.contexto, perfil)
+        except FileNotFoundError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        cartera = (contexto.get("cartera") or {}).get("activos") or []
+        await update.message.reply_text(
+            f"Al día: {len(contexto.get('categorias') or {})} categorías, "
+            f"{len(contexto.get('cuentas') or [])} cuentas y {len(cartera)} activos."
         )
 
     async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -444,7 +526,10 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
 
     # Varias cosas a la vez: un botón se atiende aunque haya un audio procesándose.
     app = Application.builder().token(token).concurrent_updates(True).build()
-    app.add_handler(CommandHandler(["start", "ayuda"], empezar))
+    app.add_handler(CommandHandler("start", empezar))
+    app.add_handler(CommandHandler(["help", "ayuda"], ayuda))
+    app.add_handler(CommandHandler(["movimientos", "ultimos"], movimientos))
+    app.add_handler(CommandHandler("recargar", recargar))
     app.add_handler(CommandHandler(["stats", "coste"], stats))
     app.add_handler(CallbackQueryHandler(boton))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voz))

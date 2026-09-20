@@ -4,6 +4,7 @@ El lado del bot de la bandeja de Folio (ver backend/core/bandeja.py en Folio).
 En la carpeta de Drive, cada perfil tiene la suya:
 
     bandeja/<perfil>/contexto.json     lo escribe Folio: categorías, cuentas y memoria
+    bandeja/<perfil>/ultimos.json      lo escribe Folio: los últimos movimientos apuntados
     bandeja/<perfil>/entrantes/*.json  lo escribe el bot: un fichero por apunte
 
 La Raspberry llega a Drive de una de dos maneras, y las dos valen:
@@ -42,6 +43,22 @@ class Bandeja:
         self._cache: dict[str, tuple[float, dict]] = {}
 
     # ── Leer lo que publica Folio ──────────────────────────────────────────
+
+    def olvidar(self, perfil: str | None = None) -> None:
+        """Tira la copia guardada para releer Drive en el siguiente mensaje (/recargar)."""
+        if perfil is None:
+            self._cache.clear()
+        else:
+            self._cache.pop(perfil, None)
+
+    def ultimos(self, perfil: str) -> dict[str, Any]:
+        """Lo último apuntado en Folio. Cambia a menudo, así que no se guarda copia."""
+        texto = self._leer(f"{_seguro(perfil)}/ultimos.json")
+        if texto is None:
+            raise FileNotFoundError(
+                "Todavía no sé lo que tienes apuntado. Abre Folio en el ordenador una vez y vuelve a preguntar."
+            )
+        return json.loads(texto)
 
     def contexto(self, perfil: str) -> dict[str, Any]:
         guardado = self._cache.get(perfil)
