@@ -436,7 +436,7 @@ def interpretar(cliente: Any, modelo: str, contexto: dict[str, Any], frase: str,
     eleccion = respuesta.choices[0].message
     if getattr(eleccion, "refusal", None):
         return Resultado(duda="Eso no lo puedo apuntar.")
-    texto = frase if imagen is None else (f"📷 {frase}".strip() if frase else "📷 ticket")
+    texto = frase if imagen is None else (f"📷 {frase}".strip() if frase else "📷 foto")
     resultado = validar(json.loads(eleccion.content or "{}"), contexto, hoy, texto, origen)
     uso = getattr(respuesta, "usage", None)
     if uso is not None:
