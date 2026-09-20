@@ -38,7 +38,7 @@ from typing import Any
 
 from .bandeja import Bandeja
 from .esperando import Esperando
-from . import estadisticas, interprete, precios
+from . import duplicados, estadisticas, interprete, precios
 
 AQUI = Path(__file__).resolve().parent
 log = logging.getLogger("folio.bot")
@@ -118,7 +118,8 @@ def resumen_cartera(op: dict[str, Any], hoy: date | None = None) -> str:
     if op["comision"]:
         partes.append(f"comisión {_dinero(op['comision'], op['divisa'])}")
     partes += [op["cuenta"] or "sin bróker", _cuando(op["fecha"], hoy)]
-    return f"{cabeza}\n" + " · ".join(escape(p) for p in partes) + "\n<i>A la Cartera</i>"
+    aviso = f"\n⚠️ <i>Ya tienes una igual: {escape(op['repetido'])}</i>" if op.get("repetido") else ""
+    return f"{cabeza}\n" + " · ".join(escape(p) for p in partes) + "\n<i>A la Cartera</i>" + aviso
 
 
 def resumen(apunte: dict[str, Any], hoy: date | None = None) -> str:
@@ -129,8 +130,9 @@ def resumen(apunte: dict[str, Any], hoy: date | None = None) -> str:
     partes = [ruta or "sin categoría", apunte["cuenta"] or "sin cuenta", _cuando(apunte["fecha"], hoy)]
     if apunte.get("compartido"):
         partes.append("a medias")
+    aviso = f"\n⚠️ <i>Ya tienes uno igual: {escape(apunte['repetido'])}</i>" if apunte.get("repetido") else ""
     return (f"{'🟢' if apunte['importe'] > 0 else '🟠'} <b>{_euros(apunte['importe'])}</b> · {escape(apunte['concepto'])}\n"
-            + " · ".join(escape(p) for p in partes))
+            + " · ".join(escape(p) for p in partes) + aviso)
 
 
 def resumen_varios(apuntes: list[dict[str, Any]], hoy: date | None = None) -> str:
@@ -141,11 +143,17 @@ def resumen_varios(apuntes: list[dict[str, Any]], hoy: date | None = None) -> st
             signo = interprete.SIGNO_CARTERA.get(a["tipo"], 0)
             dinero = (("−" if signo < 0 else "+" if signo > 0 else "") + _dinero(a["importe"], a["divisa"])) if a["importe"] else ""
             lineas.append(f"{n}. {ICONOS_CARTERA.get(a['tipo'], '📈')} {escape(a['tipo'])} · {escape(a['activo'])}"
-                          + (f" · {dinero}" if dinero else "") + f" · {_cuando(a['fecha'], hoy)}")
+                          + (f" · {dinero}" if dinero else "") + f" · {_cuando(a['fecha'], hoy)}"
+                          + (" ⚠️" if a.get("repetido") else ""))
             continue
         ruta = " › ".join(x for x in (a["categoria"], a["categoria2"]) if x) or "sin categoría"
         lineas.append(f"{n}. {_euros(a['importe'])} · {escape(a['concepto'])} · {escape(ruta)} · {_cuando(a['fecha'], hoy)}"
-                      + (" · a medias" if a.get("compartido") else ""))
+                      + (" · a medias" if a.get("compartido") else "")
+                      + (" ⚠️" if a.get("repetido") else ""))
+    repes = [(n, a) for n, a in enumerate(apuntes, 1) if a.get("repetido")]
+    if repes:
+        lineas.append("")
+        lineas += [f"⚠️ <i>El {n} ya lo tienes: {escape(a['repetido'])}</i>" for n, a in repes]
     gastos = [a for a in apuntes if a.get("clase") != "cartera"]
     if len(gastos) > 1:
         lineas.append(f"\nGastos e ingresos: <b>{_euros(sum(a['importe'] for a in gastos))}</b>")
@@ -365,6 +373,13 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             log.exception("OpenAI ha fallado")
             await update.message.reply_text("No he podido entenderlo ahora mismo (OpenAI no responde). Prueba en un rato.")
             return
+        # ¿Algo de esto ya lo tienes apuntado? Se avisa, no se impide (es local: no cuesta nada).
+        try:
+            huellas = (await asyncio.to_thread(bandeja.ultimos, perfil, 120)).get("huellas") or []
+        except Exception:
+            huellas = []
+        duplicados.marcar(resultado.apuntes, huellas)
+
         dolares = (resultado.coste_dolares or 0.0) + extra_dolares
         _apuntar_coste(dolares, tipo, perfil, len(resultado.apuntes))
         cabeza = f"🎙️ <i>«{escape(transcripcion)}»</i>\n\n" if transcripcion else ""

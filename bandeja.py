@@ -4,7 +4,8 @@ El lado del bot de la bandeja de Folio (ver backend/core/bandeja.py en Folio).
 En la carpeta de Drive, cada perfil tiene la suya:
 
     bandeja/<perfil>/contexto.json     lo escribe Folio: categorías, cuentas y memoria
-    bandeja/<perfil>/ultimos.json      lo escribe Folio: los últimos movimientos apuntados
+    bandeja/<perfil>/ultimos.json      lo escribe Folio: los últimos movimientos y las
+                                       huellas de los últimos 90 días (para los repetidos)
     bandeja/<perfil>/entrantes/*.json  lo escribe el bot: un fichero por apunte
 
 La Raspberry llega a Drive de una de dos maneras, y las dos valen:
@@ -51,14 +52,25 @@ class Bandeja:
         else:
             self._cache.pop(perfil, None)
 
-    def ultimos(self, perfil: str) -> dict[str, Any]:
-        """Lo último apuntado en Folio. Cambia a menudo, así que no se guarda copia."""
+    def ultimos(self, perfil: str, copia_segundos: int = 0) -> dict[str, Any]:
+        """
+        Lo último apuntado en Folio. Cambia a menudo, así que por defecto no se guarda
+        copia; para comparar repetidos en cada mensaje vale una de un par de minutos.
+        """
+        clave = f"ultimos:{perfil}"
+        guardado = self._cache.get(clave)
+        if guardado and copia_segundos and time.monotonic() - guardado[0] < copia_segundos:
+            return guardado[1]
         texto = self._leer(f"{_seguro(perfil)}/ultimos.json")
         if texto is None:
+            if guardado:
+                return guardado[1]
             raise FileNotFoundError(
                 "Todavía no sé lo que tienes apuntado. Abre Folio en el ordenador una vez y vuelve a preguntar."
             )
-        return json.loads(texto)
+        datos = json.loads(texto)
+        self._cache[clave] = (time.monotonic(), datos)
+        return datos
 
     def contexto(self, perfil: str) -> dict[str, Any]:
         guardado = self._cache.get(perfil)
