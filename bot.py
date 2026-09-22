@@ -31,6 +31,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+import uuid
 from html import escape
 from datetime import date, timedelta
 from pathlib import Path
@@ -236,6 +238,30 @@ RUTA_STATS = AQUI / "coste.json"
 #  Cuánto tiempo después un mensaje sin importe puede corregir el apunte anterior.
 CORREGIR_MINUTOS = 30
 
+#  Las fotos de los tickets esperan aquí, en la Raspberry, hasta que le das a ✅. Pasado
+#  esto sin mandarse (el apunte ya ha caducado), la copia de la Raspberry se tira. Lo que
+#  ya está en Drive no se toca nunca.
+DIAS_FOTO_SIN_MANDAR = 15
+
+
+def extension(imagen: bytes) -> str:
+    """Por los primeros bytes: Telegram manda JPEG, pero una captura como fichero puede ser PNG."""
+    if imagen.startswith(b"\x89PNG"):
+        return ".png"
+    if imagen[:4] == b"RIFF" and imagen[8:12] == b"WEBP":
+        return ".webp"
+    return ".jpg"
+
+
+def limpiar_fotos(carpeta: Path, dias: int = DIAS_FOTO_SIN_MANDAR) -> None:
+    limite = time.time() - dias * 86400
+    for foto in carpeta.glob("*.*") if carpeta.is_dir() else []:
+        try:
+            if foto.stat().st_mtime < limite:
+                foto.unlink()
+        except OSError:
+            pass
+
 
 def _donde(mensaje: Any) -> dict[str, Any]:
     """El chat y el número de un mensaje enviado, para poder editarlo después."""
@@ -273,6 +299,9 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
     grupos = Esperando(AQUI / "grupos.json")         # varios de un mismo mensaje
     #  Lo ya mandado a Folio: si vuelves a pulsar ✅, se contesta «ya está» y no se repite.
     enviados = Esperando(AQUI / "enviados.json")
+    #  Las fotos de los tickets hasta que se mandan (ver DIAS_FOTO_SIN_MANDAR).
+    fotos = AQUI / "tickets"
+    limpiar_fotos(fotos)
     #  Lo que se está mandando ahora mismo: un segundo toque no lo manda dos veces.
     en_curso: set[str] = set()
 
@@ -394,6 +423,18 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
         except Exception:
             huellas = []
         duplicados.marcar(resultado.apuntes, huellas)
+        if imagen is not None:
+            gastos = [a for a in resultado.apuntes if a.get("clase") == "gasto"]
+            if gastos:
+                # Una foto, un fichero: si de ella salen varios apuntes, todos la llevan.
+                nombre = f"{uuid.uuid4().hex[:16]}{extension(imagen)}"
+                try:
+                    fotos.mkdir(parents=True, exist_ok=True)
+                    (fotos / nombre).write_bytes(imagen)
+                    for a in gastos:
+                        a["ticket"] = nombre
+                except OSError:
+                    log.warning("No he podido guardar la foto del ticket", exc_info=True)
 
         dolares = (resultado.coste_dolares or 0.0) + extra_dolares
         _apuntar_coste(dolares, tipo, perfil, len(resultado.apuntes))
@@ -415,6 +456,8 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             # mensaje de antes se queda sin botones, para que no haya dos ✅ del mismo gasto.
             ident, guardado = previo
             antes = guardado["apunte"]
+            if antes.get("ticket"):
+                resultado.apuntes[0]["ticket"] = antes["ticket"]
             nuevo = {**resultado.apuntes[0], "id": ident,
                      "texto": " · ".join(x for x in ((antes.get("texto") or "").strip(), frase.strip()) if x)[:500]}
             esperando[ident] = {"perfil": perfil, "apunte": nuevo}
@@ -481,6 +524,19 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
         imagen = bytes(await fichero.download_as_bytearray())
         await entender(update, ctx, update.message.caption or "", imagen=imagen, tipo="foto")
 
+    def subir(perfil: str, apuntes: list[dict[str, Any]]) -> None:
+        """Primero las fotos, luego los apuntes: Folio nunca ve un apunte sin su foto."""
+        for nombre in dict.fromkeys(a["ticket"] for a in apuntes if a.get("ticket")):
+            ruta = fotos / nombre
+            if ruta.is_file():
+                bandeja.dejar_ticket(perfil, nombre, ruta.read_bytes())
+            else:
+                # La copia de la Raspberry ya no está: el apunte va igual, sin foto.
+                for a in apuntes:
+                    if a.get("ticket") == nombre:
+                        a.pop("ticket", None)
+        bandeja.dejar_varios(perfil, apuntes)
+
     async def mandar(consulta: Any, ident: str, perfil: str, apuntes: list[dict[str, Any]], texto: str,
                      volver: InlineKeyboardMarkup) -> None:
         """
@@ -498,7 +554,7 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             await consulta.answer("⏳ Mandando a Folio…")
             await consulta.edit_message_text(texto + "\n\n⏳ <i>Mandando a Folio…</i>", parse_mode=ParseMode.HTML)
             try:
-                await asyncio.to_thread(bandeja.dejar_varios, perfil, apuntes)
+                await asyncio.to_thread(subir, perfil, apuntes)
             except Exception:
                 log.exception("No se ha podido escribir en la bandeja")
                 await consulta.edit_message_text(texto + "\n\n⚠️ No he podido dejarlo en Drive. ¿Está montado? Vuelve a pulsar.",

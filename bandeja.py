@@ -7,6 +7,8 @@ En la carpeta de Drive, cada perfil tiene la suya:
     bandeja/<perfil>/ultimos.json      lo escribe Folio: los últimos movimientos y las
                                        huellas de los últimos 90 días (para los repetidos)
     bandeja/<perfil>/entrantes/*.json  lo escribe el bot: un fichero por apunte
+    bandeja/<perfil>/tickets/*.jpg     lo escribe el bot: la foto del ticket, antes que
+                                       su apunte. No se borra nunca.
 
 La Raspberry llega a Drive de una de dos maneras, y las dos valen:
 
@@ -116,6 +118,28 @@ class Bandeja:
             subprocess.run(["rclone", "copy", tmp, f"{self.remoto}/{_seguro(perfil)}/entrantes"], check=True,
                            capture_output=True, timeout=180)
         return nombres
+
+    def dejar_ticket(self, perfil: str, nombre: str, datos: bytes) -> None:
+        """
+        La foto del ticket en `tickets/`. Se sube **antes** que el apunte: así Folio nunca
+        recoge un apunte cuya foto aún no está.
+        """
+        relativo = f"{_seguro(perfil)}/tickets/{nombre}"
+        if self.carpeta is not None:
+            destino = self.carpeta / relativo
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            temporal = destino.with_name("." + destino.name + ".tmp")
+            temporal.write_bytes(datos)
+            os.replace(temporal, destino)
+            return
+        with tempfile.NamedTemporaryFile(suffix=Path(nombre).suffix, delete=False) as fh:
+            fh.write(datos)
+            local = fh.name
+        try:
+            subprocess.run(["rclone", "copyto", local, f"{self.remoto}/{relativo}"], check=True,
+                           capture_output=True, timeout=180)
+        finally:
+            os.unlink(local)
 
     def dejar(self, perfil: str, apunte: dict[str, Any]) -> str:
         """Deja el apunte en `entrantes/`. Devuelve el nombre del fichero."""
