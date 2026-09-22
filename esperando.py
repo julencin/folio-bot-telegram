@@ -57,3 +57,16 @@ class Esperando:
 
     def __len__(self) -> int:
         return len(self._datos)
+
+    def reciente(self, perfil: str, segundos: float) -> tuple[str, dict[str, Any]] | None:
+        """
+        El último gasto que esa persona dejó sin confirmar, si es de hace poco. Es al que se
+        refiere un «ponle de concepto brocas» que llega justo después.
+        """
+        limite = time.time() - segundos
+        candidatos = [
+            (k, v) for k, v in self._datos.items()
+            if v.get("perfil") == perfil and float(v.get("_cuando", 0)) >= limite
+            and (v.get("apunte") or {}).get("clase") == "gasto"
+        ]
+        return max(candidatos, key=lambda kv: float(kv[1].get("_cuando", 0)), default=None)

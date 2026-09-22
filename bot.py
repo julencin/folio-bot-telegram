@@ -170,6 +170,8 @@ Mándame lo que gastas o lo que te entra, como te salga:
 · tu cartera: «he metido 200 € en Bitcoin a 58.000», o la captura de la orden del bróker
 
 Te enseño lo que he entendido y, con ✅, va a la bandeja de Folio. Lo aceptas allí.
+¿Algo mal? Dímelo justo después, sin repetirlo todo: «ponle de concepto brocas», «era con la
+VISA», «es a medias», «fue ayer». Cambio el apunte de arriba.
 
 <b>Comandos</b>
 /movimientos — los últimos gastos apuntados en Folio y por dónde ibas
@@ -229,6 +231,15 @@ def texto_ultimos(datos: dict[str, Any], hoy: date | None = None) -> str:
 # ── Lo que lleva gastado el bot (para /stats) ──────────────────────────────
 
 RUTA_STATS = AQUI / "coste.json"
+
+
+#  Cuánto tiempo después un mensaje sin importe puede corregir el apunte anterior.
+CORREGIR_MINUTOS = 30
+
+
+def _donde(mensaje: Any) -> dict[str, Any]:
+    """El chat y el número de un mensaje enviado, para poder editarlo después."""
+    return {"chat": getattr(mensaje, "chat_id", None), "id": getattr(mensaje, "message_id", None)}
 
 
 def _apuntar_coste(dolares: float | None, tipo: str = "texto", perfil: str = "", apuntes: int = 0) -> None:
@@ -361,6 +372,9 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
         perfil = permitido(update)
         if perfil is None:
             return
+        # Lo último sin confirmar, por si este mensaje solo lo corrige («ponle de concepto…»).
+        # Una foto siempre es un ticket nuevo: no corrige nada.
+        previo = esperando.reciente(perfil, CORREGIR_MINUTOS * 60) if imagen is None else None
         await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         try:
             contexto = await asyncio.to_thread(bandeja.contexto, perfil)
@@ -368,7 +382,8 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             await update.message.reply_text(str(exc))
             return
         try:
-            resultado = await asyncio.to_thread(interprete.interpretar, cliente, modelo, contexto, frase, None, imagen)
+            resultado = await asyncio.to_thread(interprete.interpretar, cliente, modelo, contexto, frase, None, imagen,
+                                                anterior=previo[1]["apunte"] if previo else None)
         except Exception:  # la red, la clave, el modelo…: se dice y ya
             log.exception("OpenAI ha fallado")
             await update.message.reply_text("No he podido entenderlo ahora mismo (OpenAI no responde). Prueba en un rato.")
@@ -395,11 +410,33 @@ def main() -> None:  # pragma: no cover - necesita Telegram y OpenAI de verdad
             await update.message.reply_text(cabeza + escape(resultado.duda or "No he visto ningún gasto."),
                                             parse_mode=ParseMode.HTML)
             return
+        if resultado.corrige and previo is not None:
+            # El mismo apunte, cambiado: conserva su id (sus botones siguen valiendo) y el
+            # mensaje de antes se queda sin botones, para que no haya dos ✅ del mismo gasto.
+            ident, guardado = previo
+            antes = guardado["apunte"]
+            nuevo = {**resultado.apuntes[0], "id": ident,
+                     "texto": " · ".join(x for x in ((antes.get("texto") or "").strip(), frase.strip()) if x)[:500]}
+            esperando[ident] = {"perfil": perfil, "apunte": nuevo}
+            viejo = guardado.get("mensaje") or {}
+            if viejo.get("chat") is not None and viejo.get("id") is not None:
+                try:
+                    await ctx.bot.edit_message_text(chat_id=viejo["chat"], message_id=viejo["id"],
+                                                    text=resumen(antes) + "\n\n↪️ <i>Corregido más abajo.</i>",
+                                                    parse_mode=ParseMode.HTML)
+                except Exception:
+                    log.info("No se ha podido quitar los botones del mensaje anterior", exc_info=True)
+            enviado = await update.message.reply_text(cabeza + "✏️ <b>Corregido</b>\n" + resumen(nuevo) + pie,
+                                                      parse_mode=ParseMode.HTML, reply_markup=botones(ident))
+            esperando[ident] = {"perfil": perfil, "apunte": nuevo, "mensaje": _donde(enviado)}
+            return
         if len(resultado.apuntes) == 1:
             apunte = resultado.apuntes[0]
             esperando[apunte["id"]] = {"perfil": perfil, "apunte": apunte}
-            await update.message.reply_text(cabeza + resumen(apunte) + pie, parse_mode=ParseMode.HTML,
-                                            reply_markup=botones(apunte["id"]))
+            enviado = await update.message.reply_text(cabeza + resumen(apunte) + pie, parse_mode=ParseMode.HTML,
+                                                      reply_markup=botones(apunte["id"]))
+            # Dónde está el mensaje: si luego llega una corrección, se le quitan los botones.
+            esperando[apunte["id"]] = {"perfil": perfil, "apunte": apunte, "mensaje": _donde(enviado)}
             return
         gid = resultado.apuntes[0]["id"]
         grupos[gid] = {"perfil": perfil, "apuntes": resultado.apuntes}

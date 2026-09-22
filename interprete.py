@@ -96,8 +96,18 @@ Inversiones: van en «operaciones», NUNCA en «apuntes».
 Cada movimiento:
 - importe: siempre positivo, en euros («15,50» → 15.5; «cinco euros» → 5).
 - sentido: «sale» si gasta o paga; «entra» si recibe dinero (nómina, bizum recibido, devolución, venta).
-- concepto: corto y reconocible, como saldría en el banco. Si dice el sitio, el sitio («Bar Txoko»,
-  «Mercadona»); si no, lo genérico («Bar», «Gasolina»). Sin importes ni fechas en el concepto.
+- concepto: lo que la persona reconocería al leerlo dentro de tres meses. Corto (unas seis palabras
+  como mucho), sin importes ni fechas. Por orden:
+  · Si dice el concepto expresamente («concepto: …», «el concepto es …», «ponle …»), ESE, tal cual
+    lo dice, con mayúscula inicial. Manda sobre todo lo demás.
+  · Si dice QUÉ ha comprado, eso, y el sitio detrás entre paréntesis si lo dice: «25 € en brocas
+    para el taladro en Aliexpress» → «Brocas para taladro (Aliexpress)»; «unas zapatillas en el
+    Decathlon» → «Zapatillas (Decathlon)». El sitio solo NO vale: «Aliexpress» no dice nada.
+  · Si solo dice el sitio, porque lo que se compra ahí es obvio (un bar, un súper, una gasolinera),
+    el sitio: «Bar Txoko», «Mercadona», «Repsol».
+  · Si no dice ni qué ni dónde, lo genérico: «Bar», «Gasolina».
+  · El ticket de una compra: el comercio (el total son muchas cosas), salvo que el texto que lo
+    acompaña diga qué es.
 - categoria / categoria2 / categoria3: SOLO de su árbol de categorías. categoria2 debe colgar de
   categoria, y categoria3 de categoria2. Si no hay subcategoría que encaje, cadena vacía.
   Usa la memoria: si el concepto se parece a uno de la memoria, usa su clasificación.
@@ -110,6 +120,14 @@ Cada movimiento:
   fecha, «baja» si dudas mucho (un ticket que no se lee bien, por ejemplo).
 
 duda: vacío si todo está claro; si no, una frase corta con lo que no sabes.
+
+corrige: false salvo en el caso de abajo.
+
+Si se te da un «apunte anterior» (lo último que mandó y aún no ha confirmado) y este mensaje SOLO
+lo corrige —«ponle de concepto brocas», «no, era con la VISA», «que es a medias», «fue ayer»,
+«eran 30»— sin contar ningún gasto nuevo: corrige = true y en «apuntes» devuelves ESE apunte
+entero, con lo que dice cambiado y todo lo demás igual. Si cuenta un gasto nuevo (trae su propio
+importe y su propio sitio o motivo), corrige = false y lo tratas como siempre.
 """
 
 
@@ -123,6 +141,8 @@ class Resultado:
     tokens: dict[str, int] = field(default_factory=dict)
     #  Lo que se ha entendido de una nota de voz, para enseñarlo.
     transcripcion: str = ""
+    #  El mensaje no trae nada nuevo: corrige el apunte anterior («ponle de concepto…»).
+    corrige: bool = False
 
 
 # ── El esquema y el mensaje ────────────────────────────────────────────────
@@ -192,11 +212,12 @@ def esquema(contexto: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["apuntes", "operaciones", "duda"],
+        "required": ["apuntes", "operaciones", "duda", "corrige"],
         "properties": {
             "apuntes": {"type": "array", "items": apunte},
             "operaciones": {"type": "array", "items": operacion},
             "duda": {"type": "string"},
+            "corrige": {"type": "boolean"},
         },
     }
 
@@ -235,8 +256,21 @@ def calendario(hoy: date, dias: int = 10) -> str:
     )
 
 
+def _anterior_en_texto(apunte: dict[str, Any]) -> str:
+    """El apunte sin confirmar, como lo devolverías tú: así corregirlo es cambiar un campo."""
+    importe = float(apunte.get("importe") or 0)
+    datos = {
+        "importe": abs(importe), "sentido": "entra" if importe > 0 else "sale",
+        "concepto": apunte.get("concepto", ""), "categoria": apunte.get("categoria", ""),
+        "categoria2": apunte.get("categoria2", ""), "categoria3": apunte.get("categoria3", ""),
+        "cuenta": apunte.get("cuenta", ""), "fecha": apunte.get("fecha", ""),
+        "compartido": bool(apunte.get("compartido")),
+    }
+    return json.dumps(datos, ensure_ascii=False)
+
+
 def mensajes(contexto: dict[str, Any], frase: str, hoy: date, imagen: bytes | None = None,
-             tipo_imagen: str = "image/jpeg") -> list[dict[str, Any]]:
+             tipo_imagen: str = "image/jpeg", anterior: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     fijo = (
         f"{INSTRUCCIONES}\n"
         f"Árbol de categorías (categoría: subcategorías (subcategorías 2)):\n{_arbol_en_texto(contexto.get('categorias') or {})}\n\n"
@@ -249,6 +283,7 @@ def mensajes(contexto: dict[str, Any], frase: str, hoy: date, imagen: bytes | No
     variable = (
         f"Hoy es {DIAS[hoy.weekday()]} {hoy.isoformat()}.\n"
         f"Últimos días: {calendario(hoy)}.\n"
+        + (f"Apunte anterior, sin confirmar: {_anterior_en_texto(anterior)}\n" if anterior else "")
         + (f"Te manda la foto de un ticket. Texto que la acompaña: {frase.strip() or '(ninguno)'}"
            if imagen is not None else f"Mensaje: {frase.strip()}")
     )
@@ -407,7 +442,10 @@ def validar(bruto: dict[str, Any], contexto: dict[str, Any], hoy: date, texto: s
     duda = str(bruto.get("duda") or "")
     if not apuntes and not duda:
         duda = "No veo ningún gasto ni ingreso ahí. ¿Cuánto ha sido y en qué?"
-    return Resultado(apuntes=apuntes, duda=duda, dudoso=any(a["confianza"] != "alta" for a in apuntes))
+    # Una corrección es de UN apunte de gasto: si viene otra cosa, se trata como nuevo.
+    corrige = bool(bruto.get("corrige")) and len(apuntes) == 1 and apuntes[0]["clase"] == "gasto"
+    return Resultado(apuntes=apuntes, duda=duda, dudoso=any(a["confianza"] != "alta" for a in apuntes),
+                     corrige=corrige)
 
 
 def _extra_de_modelo(modelo: str) -> dict[str, Any]:
@@ -418,7 +456,8 @@ def _extra_de_modelo(modelo: str) -> dict[str, Any]:
 
 
 def interpretar(cliente: Any, modelo: str, contexto: dict[str, Any], frase: str, hoy: date | None = None,
-                imagen: bytes | None = None, tipo_imagen: str = "image/jpeg", origen: str = "telegram") -> Resultado:
+                imagen: bytes | None = None, tipo_imagen: str = "image/jpeg", origen: str = "telegram",
+                anterior: dict[str, Any] | None = None) -> Resultado:
     """
     Llama a OpenAI. `cliente` es un `openai.OpenAI()`; se pasa desde fuera para poder
     probar todo lo demás sin red.
@@ -426,7 +465,7 @@ def interpretar(cliente: Any, modelo: str, contexto: dict[str, Any], frase: str,
     hoy = hoy or date.today()
     respuesta = cliente.chat.completions.create(
         model=modelo,
-        messages=mensajes(contexto, frase, hoy, imagen, tipo_imagen),
+        messages=mensajes(contexto, frase, hoy, imagen, tipo_imagen, anterior),
         response_format={
             "type": "json_schema",
             "json_schema": {"name": "apuntes_folio", "strict": True, "schema": esquema(contexto)},
